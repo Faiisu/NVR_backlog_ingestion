@@ -48,6 +48,7 @@ def fresh_state():
         # Transfer stats, refreshed once a second by stats_loop().
         "bytes": 0, "expected_bytes": 0, "rate_bps": 0, "avg_bps": None,
         "elapsed_s": 0, "eta_s": None, "fraction": 0,
+        "window_bytes": 0, "window_expected_bytes": 0,
     }
 
 
@@ -157,10 +158,30 @@ def update_stats():
         return (RUN["downloaded"] - old[1]) / (now - old[0]) if now > old[0] else 0
 
     cams = STATE["cameras"].values()
-    expected = sum(max(c["expected"], c["bytes"]) for c in cams if c["stage"] not in ("fail", "cancelled") or c["bytes"])
-    remaining = sum(max(c["expected"] - c["bytes"], 0) for c in cams if c["stage"] not in FINAL_STAGES)
+    cur_win_expected = sum(max(c["expected"], c["bytes"]) for c in cams if c["stage"] not in ("fail", "cancelled") or c["bytes"])
+    cur_win_remaining = sum(max(c["expected"] - c["bytes"], 0) for c in cams if c["stage"] not in FINAL_STAGES)
+    cur_win_bytes = sum(c["bytes"] for c in cams)
+
+    total_windows = STATE.get("total_windows", 1)
+    idx = STATE.get("current_window", 1)
+
+    if total_windows > 1:
+        history = RUN.get("window_expected_history") or []
+        known_expected = sum(history) + cur_win_expected
+        avg_expected = known_expected / max(idx, 1) if known_expected > 0 else 0
+        projected_total_expected = max(round(avg_expected * total_windows), RUN.get("downloaded", 0))
+        STATE["expected_bytes"] = projected_total_expected
+        STATE["window_bytes"] = cur_win_bytes
+        STATE["window_expected_bytes"] = cur_win_expected
+        remaining_future = max(0, total_windows - idx) * avg_expected
+        total_remaining = cur_win_remaining + remaining_future
+    else:
+        STATE["expected_bytes"] = max(cur_win_expected, RUN.get("downloaded", 0))
+        STATE["window_bytes"] = cur_win_bytes
+        STATE["window_expected_bytes"] = cur_win_expected
+        total_remaining = cur_win_remaining
+
     STATE["bytes"] = RUN["downloaded"]
-    STATE["expected_bytes"] = expected
     STATE["rate_bps"] = rate_over(SPEED_WINDOW_S)
     STATE["elapsed_s"] = round(now - RUN["t0"])
 
@@ -170,19 +191,17 @@ def update_stats():
     else:
         eta_rate = rate_over(ETA_WINDOW_S)
         waiting = STATE["phase"] == "searching" or STATE["cancelling"]
-        STATE["eta_s"] = None if waiting or eta_rate <= 0 else round(remaining / eta_rate)
-        total_windows = STATE.get("total_windows", 1)
+        STATE["eta_s"] = None if waiting or eta_rate <= 0 else round(total_remaining / eta_rate)
         if total_windows > 1:
-            idx = STATE.get("current_window", 1)
             cams_count = STATE.get("cams_count") or len(cams) or 1
-            if expected:
-                win_fraction = sum(c["bytes"] for c in cams) / expected
+            if cur_win_expected:
+                win_fraction = cur_win_bytes / cur_win_expected
             else:
                 completed_in_window = STATE["done"] - (idx - 1) * cams_count
                 win_fraction = max(0.0, completed_in_window / cams_count)
             fraction = ((idx - 1) + min(win_fraction, 1.0)) / total_windows
         else:
-            fraction = RUN["downloaded"] / expected if expected else 0
+            fraction = RUN["downloaded"] / STATE["expected_bytes"] if STATE["expected_bytes"] else 0
     # Never move backwards (e.g. when a segment turns out larger than the search reported).
     STATE["fraction"] = max(STATE["fraction"], min(fraction, 0.99))
 
@@ -400,6 +419,14 @@ def do_run(plan):
 
             w_results = core.run_batch(plan["rows"], plan["args"], w_start, w_end,
                                        callbacks=GuiCallbacks(), cancel_event=CANCEL_EVENT, proc_registry=REGISTRY)
+            with LOCK:
+                cams = STATE["cameras"].values()
+                win_expected = sum(max(c["expected"], c["bytes"]) for c in cams if c["stage"] not in ("fail", "cancelled") or c["bytes"])
+                RUN.setdefault("window_expected_history", []).append(win_expected)
+                RUN["completed_windows_bytes"] = RUN["downloaded"]
+            if total_windows > 1:
+                for r in w_results:
+                    r.setdefault("notes", []).insert(0, f"[{w_start.strftime('%Y-%m-%d')}]")
             all_results.extend(w_results)
 
         log_path = os.path.join(OUTPUT_DIR, "logs", f"run_{datetime.now():%Y%m%d_%H%M%S}.csv")
@@ -830,8 +857,12 @@ function renderProgress(s){
     const finishAt = (!s.cancelling && s.eta_s != null)
       ? new Date(Date.now() + s.eta_s * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'})
       : '—';
+    const dayStats = (!snapshotOnly && s.total_windows > 1 && s.window_expected_bytes > 0)
+      ? `<span>Day ${s.current_window}/${s.total_windows}: <b>${fmtBytes(s.window_bytes)}</b> of <b>${fmtBytes(s.window_expected_bytes)}</b></span>`
+      : '';
     stats.innerHTML = `<span>Speed <b>${fmtRate(s.rate_bps)}</b></span>`
-      + (snapshotOnly ? '' : `<span>Downloaded <b>${fmtBytes(s.bytes)}</b> of <b>${s.phase === 'searching' ? '…' : fmtBytes(s.expected_bytes)}</b></span>`)
+      + (snapshotOnly ? '' : `<span>Downloaded <b>${fmtBytes(s.bytes)}</b> of <b>${s.phase === 'searching' && s.expected_bytes === 0 ? '…' : (s.total_windows > 1 ? '~' : '') + fmtBytes(s.expected_bytes)}</b></span>`)
+      + dayStats
       + `<span>Elapsed <b>${fmtDur(s.elapsed_s)}</b></span>`
       + (snapshotOnly ? '' : `<span>Remaining <b>${s.eta_s == null || s.cancelling ? '—' : '~' + fmtDur(s.eta_s)}</b></span>`
       + `<span>Finish at <b>${finishAt}</b></span>`);
@@ -1066,7 +1097,10 @@ class Handler(BaseHTTPRequestHandler):
                 "total_windows": total_windows,
             })
             RUN.clear()
-            RUN.update({"t0": time.monotonic(), "downloaded": 0, "searched": 0, "samples": collections.deque()})
+            RUN.update({
+                "t0": time.monotonic(), "downloaded": 0, "searched": 0, "samples": collections.deque(),
+                "completed_windows_bytes": 0, "window_expected_history": [],
+            })
             for row in plan["rows"]:
                 STATE["cameras"][core.camera_key(row)] = {
                     "name": row.get("name"), "nvr": row["nvr"].strip(), "channel": row["channel"].strip(),

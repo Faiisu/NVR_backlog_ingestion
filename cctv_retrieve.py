@@ -441,7 +441,22 @@ def plan_camera(row, client, start, end, mode):
 
 
 def covered_seconds(plan, start, end):
-    return sum(max((min(end, s.end) - max(start, s.start)).total_seconds(), 0) for s in plan.segments)
+    intervals = []
+    for s in (plan.segments or []):
+        s_clamped, e_clamped = max(start, s.start), min(end, s.end)
+        if e_clamped > s_clamped:
+            intervals.append((s_clamped, e_clamped))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    merged = [intervals[0]]
+    for cur_s, cur_e in intervals[1:]:
+        prev_s, prev_e = merged[-1]
+        if cur_s <= prev_e:
+            merged[-1] = (prev_s, max(prev_e, cur_e))
+        else:
+            merged.append((cur_s, cur_e))
+    return sum((e - s).total_seconds() for s, e in merged)
 
 
 def file_done(path):
@@ -506,12 +521,17 @@ def mark_existing(plan, args, start, end):
 
 
 def trim_parts(plan, start, end, seg_paths):
-    """(segment file, offset into it, duration) for each piece of the window covered by a recording."""
+    """(segment file, offset into it, duration) for each piece of the window covered by a recording.
+    Deduplicates overlapping segments so footage is not repeated in the trimmed clip.
+    """
     parts = []
-    for seg in plan.segments:
-        s, e = max(start, seg.start), min(end, seg.end)
+    last_end = start
+    for seg in (plan.segments or []):
+        s = max(start, seg.start, last_end)
+        e = min(end, seg.end)
         if e > s:
             parts.append((seg_paths[seg.name], (s - seg.start).total_seconds(), (e - s).total_seconds()))
+            last_end = e
     return parts
 
 
@@ -686,6 +706,12 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
                 if not ok:
                     return False, err
                 pieces.append(piece)
+                # Free disk space: if src is a temporary file in work_dir and not needed in subsequent parts, remove it
+                if os.path.dirname(os.path.abspath(src)) == os.path.abspath(work_dir) and all(p[0] != src for p in parts[i + 1:]):
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
             cmd = ["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0", "-c:v", "copy"]
             if audio:
                 cmd.extend(["-map", "0:a?", "-c:a", "copy"])
@@ -762,8 +788,9 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
         need = plan.expected_bytes
         disk_check_dir = args.output_dir
         free = shutil.disk_usage(disk_check_dir).free
-        if need * 1.1 > free:
-            raise IsapiError(f"not enough disk space: need ~{need / 1e9:.1f} GB, {free / 1e9:.1f} GB free")
+        headroom = 2.2 if getattr(args, "trim", False) else 1.2
+        if need * headroom > free:
+            raise IsapiError(f"not enough disk space: need ~{need * headroom / 1e9:.1f} GB, {free / 1e9:.1f} GB free")
 
         existing = plan.existing or set()
         legacy = plan.legacy or set()
@@ -1027,7 +1054,7 @@ def main():
     ap.add_argument("--end", help="NVR local end time 'YYYY-MM-DD HH:MM:SS' (default: now)")
     ap.add_argument("--last-minutes", type=float, default=5,
                     help="If --start/--end omitted, fetch the last N minutes up to now (default 5)")
-    ap.add_argument("--tz-offset-hours", type=float, default=float(os.environ.get("TZ_OFFSET_HOURS", 7)),
+    ap.add_argument("--tz-offset-hours", type=float, default=float(os.environ.get("TZ_OFFSET_HOURS", "7")),
                     help="NVR clock timezone vs UTC, used only to compute 'now' for --last-minutes (default 7)")
     ap.add_argument("--start-date", help="Start date 'YYYY-MM-DD' for daily recurring window")
     ap.add_argument("--end-date", help="End date 'YYYY-MM-DD' for daily recurring window")

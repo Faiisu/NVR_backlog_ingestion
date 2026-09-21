@@ -36,6 +36,48 @@ class TestTimeWindows(unittest.TestCase):
         self.assertEqual(windows[0], (datetime(2026, 9, 10, 22, 0, 0), datetime(2026, 9, 11, 4, 0, 0)))
         self.assertEqual(windows[1], (datetime(2026, 9, 11, 22, 0, 0), datetime(2026, 9, 12, 4, 0, 0)))
 
+    def test_covered_seconds_and_trim_parts_overlapping_segments(self):
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        # Segment 1: 10:00 to 10:30 (1800s)
+        # Segment 2: 10:20 to 11:00 (overlaps 10:20-10:30 with seg1)
+        # Segment 3: 10:40 to 10:50 (completely subsumed by seg2)
+        s1 = core.Segment(
+            uri="u1", name="seg1",
+            start=datetime(2026, 9, 10, 10, 0, 0),
+            end=datetime(2026, 9, 10, 10, 30, 0),
+            size=1000,
+        )
+        s2 = core.Segment(
+            uri="u2", name="seg2",
+            start=datetime(2026, 9, 10, 10, 20, 0),
+            end=datetime(2026, 9, 10, 11, 0, 0),
+            size=2000,
+        )
+        s3 = core.Segment(
+            uri="u3", name="seg3",
+            start=datetime(2026, 9, 10, 10, 40, 0),
+            end=datetime(2026, 9, 10, 10, 50, 0),
+            size=500,
+        )
+        plan = core.CameraPlan(row=row, key="192.168.1.10/D1", segments=[s1, s2, s3])
+        start = datetime(2026, 9, 10, 10, 0, 0)
+        end = datetime(2026, 9, 10, 11, 0, 0)
+
+        # 1. covered_seconds should be 3600 seconds (10:00 to 11:00), not double counting overlaps
+        covered = core.covered_seconds(plan, start, end)
+        self.assertEqual(covered, 3600.0)
+
+        # 2. trim_parts should produce pieces covering 10:00 to 11:00 with no duplicated footage
+        seg_paths = {"seg1": "/tmp/seg1.ps", "seg2": "/tmp/seg2.ps", "seg3": "/tmp/seg3.ps"}
+        parts = core.trim_parts(plan, start, end, seg_paths)
+        self.assertEqual(len(parts), 2)  # seg3 is subsumed, so only 2 pieces
+        # Piece 1: from seg1, offset 0, dur 1800s (10:00 to 10:30)
+        self.assertEqual(parts[0], ("/tmp/seg1.ps", 0.0, 1800.0))
+        # Piece 2: from seg2, offset (10:30 - 10:20 = 600s), dur (11:00 - 10:30 = 1800s)
+        self.assertEqual(parts[1], ("/tmp/seg2.ps", 600.0, 1800.0))
+        # Total duration of pieces equals covered_seconds
+        self.assertEqual(sum(p[2] for p in parts), covered)
+
 
 class TestLegacyDetectionAndRepair(unittest.TestCase):
     def setUp(self):
@@ -710,6 +752,50 @@ class TestWebGuiFeatures(unittest.TestCase):
         # fraction = ((3 - 1) + 0) / 3 = 2 / 3 ~ 0.6667
         self.assertAlmostEqual(webgui.STATE["fraction"], 2.0 / 3, places=2)
 
+    def test_multi_window_accounting_and_expected_bytes(self):
+        import webgui
+
+        # 3-window run with 2 cameras, 1000 bytes expected per camera per day (2000 bytes/day)
+        webgui.STATE["total_windows"] = 3
+        webgui.STATE["current_window"] = 1
+        webgui.STATE["cams_count"] = 2
+        webgui.STATE["total"] = 6
+        webgui.STATE["cameras"] = {
+            "cam1": {"stage": "downloading", "bytes": 0, "expected": 1000},
+            "cam2": {"stage": "downloading", "bytes": 0, "expected": 1000},
+        }
+        webgui.RUN["downloaded"] = 0
+        webgui.RUN["window_expected_history"] = []
+
+        # Day 1: download 1000 bytes in cam1
+        webgui.STATE["cameras"]["cam1"]["bytes"] = 1000
+        webgui.STATE["cameras"]["cam2"]["bytes"] = 1000
+        webgui.RUN["downloaded"] = 2000
+        webgui.update_stats()
+        # Projected total for 3 days: 2000 * 3 = 6000
+        self.assertEqual(webgui.STATE["expected_bytes"], 6000)
+        self.assertEqual(webgui.STATE["bytes"], 2000)
+        self.assertEqual(webgui.STATE["window_bytes"], 2000)
+        self.assertEqual(webgui.STATE["window_expected_bytes"], 2000)
+
+        # Day 1 finishes: record history
+        webgui.RUN["window_expected_history"].append(2000)
+        webgui.RUN["completed_windows_bytes"] = 2000
+
+        # Day 2 starts: cam bytes reset
+        webgui.STATE["current_window"] = 2
+        webgui.STATE["cameras"]["cam1"]["bytes"] = 500
+        webgui.STATE["cameras"]["cam2"]["bytes"] = 500
+        webgui.RUN["downloaded"] = 3000  # 2000 from Day 1 + 1000 in Day 2
+        webgui.update_stats()
+
+        # Crucial check: expected_bytes must be projected across all days (6000), NEVER less than bytes (3000)
+        self.assertGreaterEqual(webgui.STATE["expected_bytes"], webgui.STATE["bytes"])
+        self.assertEqual(webgui.STATE["expected_bytes"], 6000)
+        self.assertEqual(webgui.STATE["bytes"], 3000)
+        self.assertEqual(webgui.STATE["window_bytes"], 1000)
+        self.assertEqual(webgui.STATE["window_expected_bytes"], 2000)
+
     def test_atomic_config_saving(self):
         import webgui
         cfg_file = os.path.join(self.test_dir, "config.env")
@@ -835,6 +921,35 @@ class TestWebGuiFeatures(unittest.TestCase):
 
         logs = webgui.STATE["log"]
         self.assertTrue(any("[1/1] Repaired legacy file: legacy_rec.mp4" in l for l in logs))
+
+    def test_multi_window_run_log_notes_prefixed(self):
+        import webgui
+
+        w1 = (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 22, 0, 0))
+        w2 = (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 22, 0, 0))
+        plan = {
+            "windows": [w1, w2],
+            "rows": [{"name": "Gate", "nvr": "192.168.1.10", "channel": "D1"}],
+            "args": None,
+        }
+        webgui.STATE["cameras"] = {"192.168.1.10/D1": {"expected": 1000, "bytes": 1000, "stage": "ok"}}
+
+        def fake_run_batch(rows, args, start, end, **kw):
+            return [{"name": "Gate", "nvr": "192.168.1.10", "channel": "D1", "ok": True, "errors": [], "notes": ["downloaded"], "files": []}]
+
+        orig_run_batch = core.run_batch
+        orig_write_log = core.write_run_log
+        captured_results = []
+        core.run_batch = fake_run_batch
+        core.write_run_log = lambda results, path: captured_results.extend(results)
+        try:
+            webgui.do_run(plan)
+            self.assertEqual(len(captured_results), 2)
+            self.assertIn("[2026-09-10]", captured_results[0]["notes"][0])
+            self.assertIn("[2026-09-11]", captured_results[1]["notes"][0])
+        finally:
+            core.run_batch = orig_run_batch
+            core.write_run_log = orig_write_log
 
 
 if __name__ == "__main__":
