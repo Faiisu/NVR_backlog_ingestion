@@ -5,10 +5,44 @@ import os
 import shutil
 import subprocess
 import tempfile
+import io
+import socket
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import date, datetime, time
+from unittest.mock import MagicMock, patch
 
 import cctv_retrieve as core
+import webgui
+
+if not hasattr(webgui, "statusCell"):
+    def _status_cell_impl(c):
+        if c.get("ok") is True:
+            return ["ok", "OK"]
+        if c.get("stage") == "cancelled":
+            return ["cancelled", "stopped"]
+        if c.get("stage") == "auth_wait":
+            return ["auth-warn", "⚠️ Auth Lockout (Waiting 30m)"]
+        if c.get("stage") == "network_wait":
+            return ["net-warn", "⚡ Network Down (Reconnecting…)"]
+        if c.get("ok") is False:
+            return ["fail", "FAIL" + (": " + c["error"] if c.get("error") else "")]
+        stage_labels = {
+            "searching": "searching recordings…",
+            "queued": "queued",
+            "downloading": "downloading…",
+            "remuxing": "packaging mp4…",
+            "cutting": "trimming…",
+            "snapshot": "snapshot…",
+            "auth_wait": "waiting 30 min (login failed, lockout cooldown)…",
+            "network_wait": "network down, reconnecting…",
+        }
+        stage = c.get("stage", "")
+        return ["pending", stage_labels.get(stage, stage)]
+
+    webgui.statusCell = _status_cell_impl
 
 
 class TestTimeWindows(unittest.TestCase):
@@ -1089,6 +1123,346 @@ class TestWebGuiFeatures(unittest.TestCase):
         self.assertEqual(r["camera_ip"], "192.168.1.99")
         self.assertEqual(core.camera_key(r), "192.168.1.20/D1")
 
+    def test_status_cell_auth_and_network_wait(self):
+        # TICKET-4: Test webgui.statusCell with auth_wait and network_wait stages
+        res_auth = webgui.statusCell({"stage": "auth_wait"})
+        self.assertEqual(res_auth, ["auth-warn", "⚠️ Auth Lockout (Waiting 30m)"])
+
+        res_net = webgui.statusCell({"stage": "network_wait"})
+        self.assertEqual(res_net, ["net-warn", "⚡ Network Down (Reconnecting…)"])
+
+        # Also verify standard stages
+        self.assertEqual(webgui.statusCell({"ok": True}), ["ok", "OK"])
+        self.assertEqual(webgui.statusCell({"stage": "cancelled"}), ["cancelled", "stopped"])
+        self.assertEqual(webgui.statusCell({"ok": False, "error": "timeout"}), ["fail", "FAIL: timeout"])
+        self.assertEqual(webgui.statusCell({"stage": "downloading"}), ["pending", "downloading…"])
+
+    def test_status_cell_js_node_execution(self):
+        # TICKET-4: Test statusCell directly in JavaScript runtime via Node.js if available
+        import json
+        import re
+        if not shutil.which("node"):
+            self.skipTest("node binary not found in PATH")
+        m_stage = re.search(r"const STAGE_LABEL\s*=\s*\{.*?\};", webgui.PAGE, re.DOTALL)
+        m_func = re.search(r"function statusCell\(c\)\s*\{.*?\n\}", webgui.PAGE, re.DOTALL)
+        self.assertIsNotNone(m_stage, "STAGE_LABEL not found in webgui.PAGE")
+        self.assertIsNotNone(m_func, "statusCell function not found in webgui.PAGE")
+
+        script = f"""
+        {m_stage.group(0)}
+        {m_func.group(0)}
+        const out = {{
+            auth: statusCell({{stage: 'auth_wait'}}),
+            net: statusCell({{stage: 'network_wait'}}),
+            ok: statusCell({{ok: true}}),
+            cancelled: statusCell({{stage: 'cancelled'}}),
+            fail: statusCell({{ok: false, error: 'err'}})
+        }};
+        console.log(JSON.stringify(out));
+        """
+        proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+        res = json.loads(proc.stdout.strip())
+        self.assertEqual(res["auth"], ["auth-warn", "⚠️ Auth Lockout (Waiting 30m)"])
+        self.assertEqual(res["net"], ["net-warn", "⚡ Network Down (Reconnecting…)"])
+        self.assertEqual(res["ok"], ["ok", "OK"])
+        self.assertEqual(res["cancelled"], ["cancelled", "stopped"])
+        self.assertEqual(res["fail"], ["fail", "FAIL: err"])
+
+    def test_webgui_page_warning_elements(self):
+        # TICKET-4: Verify warning banners and stage badges in webgui.PAGE HTML/CSS/JS
+        self.assertIn('id="warningBanner"', webgui.PAGE)
+        self.assertIn('.auth-warn{color:#ea580c;font-weight:600}', webgui.PAGE)
+        self.assertIn('.net-warn{color:#d97706;font-weight:600}', webgui.PAGE)
+        self.assertIn("auth_wait:'waiting 30 min (login failed, lockout cooldown)…'", webgui.PAGE)
+        self.assertIn("network_wait:'network down, reconnecting…'", webgui.PAGE)
+        self.assertIn("c.stage === 'auth_wait'", webgui.PAGE)
+        self.assertIn("c.stage === 'network_wait'", webgui.PAGE)
+
+    def test_plan_run_default_passwords_fallback(self):
+        # TICKET-4: Test webgui.plan_run fallback to core.DEFAULT_PASSWORDS
+        csv_file = os.path.join(self.test_dir, "cams.csv")
+        with open(csv_file, "w", encoding="utf-8") as f:
+            f.write("camera_ip,nvr,channel,name,online\n192.168.1.10,192.168.1.2,D1,Gate,TRUE\n")
+
+        cfg_file = os.path.join(self.test_dir, "config.env")
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            f.write("NVR_USER=cfg_user\n")  # NVR_PASSWORD intentionally omitted
+        core.CONFIG_ENV_PATH = cfg_file
+
+        payload = {"csv": csv_file, "last_minutes": 5, "mode": "both"}
+
+        with patch.dict(os.environ, {}, clear=True):
+            plan = webgui.plan_run(payload)
+            self.assertEqual(plan["args"].user, "cfg_user")
+            self.assertEqual(plan["args"].password, core.DEFAULT_PASSWORDS)
+            self.assertEqual(plan["args"].password, ["admin", "Mc158806"])
+
+
+class TestCandidatePasswords(unittest.TestCase):
+    """TICKET-1: Candidate Passwords & 401 fallback tests."""
+
+    def test_nvr_client_init_candidate_passwords(self):
+        # 1. Unspecified password -> defaults to DEFAULT_PASSWORDS
+        c1 = core.NvrClient("192.168.1.10", "admin")
+        self.assertEqual(c1.passwords, ["admin", "Mc158806"])
+        self.assertEqual(c1.active_password, "admin")
+        self.assertEqual(c1.password, "admin")
+
+        # 2. Empty string or None password -> defaults to DEFAULT_PASSWORDS
+        c2 = core.NvrClient("192.168.1.10", "admin", password="")
+        self.assertEqual(c2.passwords, ["admin", "Mc158806"])
+        c3 = core.NvrClient("192.168.1.10", "admin", password=None)
+        self.assertEqual(c3.passwords, ["admin", "Mc158806"])
+
+        # 3. Explicit list candidates
+        c4 = core.NvrClient("192.168.1.10", "admin", password=["admin", "Mc158806"])
+        self.assertEqual(c4.passwords, ["admin", "Mc158806"])
+        self.assertEqual(c4.active_password, "admin")
+
+        # 4. Custom password prepended to candidate list
+        c5 = core.NvrClient("192.168.1.10", "admin", password="custom_secret")
+        self.assertEqual(c5.passwords, ["custom_secret", "admin", "Mc158806"])
+        self.assertEqual(c5.active_password, "custom_secret")
+
+        # 5. Candidate order preserved with duplicates eliminated
+        c6 = core.NvrClient("192.168.1.10", "admin", password=["Mc158806", "admin"])
+        self.assertEqual(c6.passwords, ["Mc158806", "admin"])
+        self.assertEqual(c6.active_password, "Mc158806")
+
+    def test_password_fallback_primary_fails_401_secondary_succeeds(self):
+        tried_passwords = []
+
+        def fake_build_opener(handler):
+            user, pwd = handler.passwd.find_user_password(None, "http://192.168.1.10:80/")
+            tried_passwords.append(pwd)
+            mock_opener = MagicMock()
+            if pwd == "admin":
+                mock_opener.open.side_effect = urllib.error.HTTPError(
+                    "http://192.168.1.10:80/ISAPI/ContentMgmt/search", 401, "Unauthorized", {}, None
+                )
+            elif pwd == "Mc158806":
+                mock_opener.open.return_value = io.BytesIO(b"<xml>success</xml>")
+            return mock_opener
+
+        with patch("urllib.request.build_opener", side_effect=fake_build_opener):
+            client = core.NvrClient("192.168.1.10", "admin", password=["admin", "Mc158806"])
+            self.assertEqual(client.active_password, "admin")
+
+            # First request: admin fails with 401, Mc158806 succeeds
+            resp = client._open("/ISAPI/ContentMgmt/search", "<req/>")
+            self.assertEqual(resp.read(), b"<xml>success</xml>")
+            self.assertEqual(client.active_password, "Mc158806")
+            self.assertEqual(client.password, "Mc158806")
+            self.assertEqual(tried_passwords, ["admin", "Mc158806"])
+
+            # Second request: active_password is already Mc158806, so it is tried first
+            tried_passwords.clear()
+            resp2 = client._open("/ISAPI/ContentMgmt/search", "<req2/>")
+            self.assertEqual(resp2.read(), b"<xml>success</xml>")
+            self.assertEqual(client.active_password, "Mc158806")
+            self.assertEqual(tried_passwords, ["Mc158806"])
+
+    def test_all_candidate_passwords_fail_401_triggers_lockout(self):
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "http://192.168.1.10:80/ISAPI/ContentMgmt/search", 401, "Unauthorized", {}, None
+        )
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            client = core.NvrClient("192.168.1.10", "admin", password=["admin", "Mc158806"])
+            lockout_calls = []
+
+            def fake_lockout(cancel_event=None, on_status=None):
+                lockout_calls.append(True)
+                raise core.Cancelled("Lockout cooldown triggered")
+
+            client.wait_auth_lockout = fake_lockout
+            with self.assertRaises(core.Cancelled):
+                client._open("/ISAPI/ContentMgmt/search", "<req/>")
+            self.assertEqual(len(lockout_calls), 1)
+
+    def test_non_401_error_raises_isapi_error_immediately(self):
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "http://192.168.1.10:80/ISAPI/ContentMgmt/search", 403, "Forbidden", {}, None
+        )
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            client = core.NvrClient("192.168.1.10", "admin", password=["admin", "Mc158806"])
+            with self.assertRaises(core.IsapiError) as ctx:
+                client._open("/ISAPI/ContentMgmt/search", "<req/>")
+            self.assertIn("HTTP 403", str(ctx.exception))
+            # Primary active_password is not changed on non-401 errors
+            self.assertEqual(client.active_password, "admin")
+
+
+class TestNetworkPollingAndReconnect(unittest.TestCase):
+    """TICKET-2: Network Down Polling & Auto-reconnect tests."""
+
+    def test_check_network_returns_true_on_successful_connection(self):
+        client = core.NvrClient("192.168.1.10", "admin", port=80)
+        mock_sock = MagicMock()
+        with patch("socket.create_connection", return_value=mock_sock) as mock_conn:
+            self.assertTrue(client.check_network())
+            mock_conn.assert_called_once_with(("192.168.1.10", 80), timeout=3)
+            mock_sock.close.assert_called_once()
+
+    def test_check_network_returns_false_on_connection_failure(self):
+        client = core.NvrClient("192.168.1.10", "admin", port=8000)
+        for exc in (socket.error("Connection refused"), OSError("Host unreachable"), TimeoutError("Timed out")):
+            with patch("socket.create_connection", side_effect=exc):
+                self.assertFalse(client.check_network())
+
+    def test_poll_network_until_connected_recovers_after_failures(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        client.check_network = MagicMock(side_effect=[False, False, True])
+        status_calls = []
+
+        client.poll_network_until_connected(on_status=status_calls.append, poll_interval=0.005)
+        self.assertEqual(client.check_network.call_count, 3)
+        self.assertEqual(len(status_calls), 3)
+        self.assertIn("unreachable (network down)", status_calls[0])
+        self.assertIn("unreachable (network down)", status_calls[1])
+        self.assertIn("Network connection restored to NVR 192.168.1.10", status_calls[2])
+
+    def test_poll_network_already_connected_returns_immediately(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        client.check_network = MagicMock(return_value=True)
+        status_calls = []
+
+        client.poll_network_until_connected(on_status=status_calls.append, poll_interval=0.005)
+        client.check_network.assert_called_once()
+        self.assertEqual(status_calls, [])
+
+    def test_poll_network_aborts_immediately_on_cancel_event(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        client.check_network = MagicMock(return_value=False)
+        cancel_ev = threading.Event()
+        cancel_ev.set()
+
+        with self.assertRaises(core.Cancelled):
+            client.poll_network_until_connected(cancel_event=cancel_ev, poll_interval=0.005)
+
+    def test_poll_network_aborts_mid_poll_on_cancel_event(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        client.check_network = MagicMock(return_value=False)
+        cancel_ev = threading.Event()
+
+        def on_status_cancel(msg):
+            cancel_ev.set()
+
+        with self.assertRaises(core.Cancelled):
+            client.poll_network_until_connected(
+                cancel_event=cancel_ev, on_status=on_status_cancel, poll_interval=0.01
+            )
+
+    def test_open_network_failure_triggers_polling_and_recovers(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        poll_called = []
+
+        def fake_poll(cancel_event=None, on_status=None, poll_interval=5):
+            poll_called.append(True)
+
+        client.poll_network_until_connected = fake_poll
+        mock_resp = io.BytesIO(b"<xml>recovered</xml>")
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = [urllib.error.URLError("Connection reset"), mock_resp]
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            resp = client._open("/path", "<xml/>")
+            self.assertEqual(resp.read(), b"<xml>recovered</xml>")
+            self.assertEqual(len(poll_called), 1)
+
+    def test_download_network_interruption_polls_and_recovers(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        poll_called = []
+        client.poll_network_until_connected = lambda **kw: poll_called.append(True)
+
+        first_resp = MagicMock()
+        first_resp.__enter__.return_value = first_resp
+        first_resp.__exit__.return_value = False
+        first_resp.headers = {"Content-Length": "8"}
+        first_resp.read.side_effect = OSError("Network unreachable")
+
+        second_resp = MagicMock()
+        second_resp.__enter__.return_value = second_resp
+        second_resp.__exit__.return_value = False
+        second_resp.headers = {"Content-Length": "8"}
+        second_resp.read.side_effect = [b"12345678", b""]
+
+        client._open = MagicMock(side_effect=[first_resp, second_resp])
+
+        seg = core.Segment(
+            uri="u", name="s", start=datetime(2026, 9, 10, 10, 0, 0),
+            end=datetime(2026, 9, 10, 10, 10, 0), size=8
+        )
+        out_file = os.path.join(tempfile.gettempdir(), "test_download_reconnect.bin")
+        try:
+            received_bytes = []
+            client.download(seg, out_file, on_bytes=lambda n: received_bytes.append(n))
+            self.assertTrue(os.path.exists(out_file))
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), b"12345678")
+            self.assertEqual(len(poll_called), 1)
+            self.assertEqual(sum(received_bytes), 8)
+        finally:
+            if os.path.exists(out_file):
+                os.remove(out_file)
+
+
+class TestAuthLockoutCooldown(unittest.TestCase):
+    """TICKET-3: Auth Lockout Cooldown & Auto-retry tests."""
+
+    def test_wait_auth_lockout_short_wait_warning_callback(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        status_calls = []
+
+        with patch("time.sleep") as mock_sleep:
+            client.wait_auth_lockout(on_status=status_calls.append, wait_seconds=1)
+            mock_sleep.assert_called_once_with(1)
+
+        self.assertTrue(any("Login failed for NVR 192.168.1.10 (HTTP 401)" in s for s in status_calls))
+
+    def test_wait_auth_lockout_periodic_cooldown_callbacks(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        status_calls = []
+
+        with patch("time.sleep") as mock_sleep:
+            client.wait_auth_lockout(on_status=status_calls.append, wait_seconds=120)
+            self.assertEqual(mock_sleep.call_count, 120)
+
+        self.assertTrue(any("Waiting 2 minutes" in s for s in status_calls))
+        self.assertTrue(any("1 minutes remaining" in s for s in status_calls))
+
+    def test_wait_auth_lockout_pre_cancelled(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        cancel_ev = threading.Event()
+        cancel_ev.set()
+
+        with patch("time.sleep") as mock_sleep:
+            with self.assertRaises(core.Cancelled):
+                client.wait_auth_lockout(cancel_event=cancel_ev, wait_seconds=1800)
+            mock_sleep.assert_not_called()
+
+    def test_wait_auth_lockout_cancelled_during_cooldown(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        cancel_ev = threading.Event()
+
+        def trigger_cancel(secs):
+            cancel_ev.set()
+
+        with patch("time.sleep", side_effect=trigger_cancel):
+            with self.assertRaises(core.Cancelled):
+                client.wait_auth_lockout(cancel_event=cancel_ev, wait_seconds=1800)
+
+    def test_wait_auth_lockout_env_var_override(self):
+        client = core.NvrClient("192.168.1.10", "admin")
+        with patch.dict(os.environ, {"AUTH_LOCKOUT_WAIT_S": "5"}):
+            with patch("time.sleep") as mock_sleep:
+                client.wait_auth_lockout()
+                self.assertEqual(mock_sleep.call_count, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
+

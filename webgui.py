@@ -376,7 +376,7 @@ def plan_run(payload):
         pass
     args = Args()
     args.user = os.environ.get("NVR_USER") or cfg.get("NVR_USER") or "admin"
-    args.password = os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or "admin"
+    args.password = os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or core.DEFAULT_PASSWORDS
     args.mode = mode
     args.output_dir = OUTPUT_DIR
     args.workers = workers
@@ -490,6 +490,10 @@ td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
 .fail{color:#dc2626;font-weight:600}
 .cancelled{color:#d97706;font-weight:600}
 .pending{opacity:.6}
+.auth-warn{color:#ea580c;font-weight:600}
+.net-warn{color:#d97706;font-weight:600}
+#warningBanner{display:none;background:#fef3c7;color:#92400e;border:1px solid #f59e0b;padding:8px 12px;border-radius:6px;margin:8px 0;font-size:.85rem;font-weight:600}
+@media (prefers-color-scheme:dark){#warningBanner{background:#451a03;color:#fde68a;border-color:#b45309}}
 .note{display:block;font-weight:400;color:#d97706;font-size:.75rem}
 #runMsg{margin-left:10px;font-size:.85rem;color:#dc2626}
 button.small{padding:3px 10px;font-size:.8rem}
@@ -612,6 +616,7 @@ tr.off td:last-child{opacity:1}
 <fieldset>
 <legend>Progress</legend>
 <div id="summary">Idle.</div>
+<div id="warningBanner"></div>
 <div id="progressBar"><div id="progressFill"></div><div id="progressText"></div></div>
 <div id="stats"></div>
 <div class="tablewrap">
@@ -635,7 +640,9 @@ const TRIM_HINT = {
 };
 function updateTrimHint(){ document.getElementById('trimHint').textContent = TRIM_HINT[document.getElementById('trim').checked]; }
 const STAGE_LABEL = {searching:'searching recordings…', queued:'queued', downloading:'downloading…',
-                     remuxing:'packaging mp4…', cutting:'trimming…', snapshot:'snapshot…'};
+                     remuxing:'packaging mp4…', cutting:'trimming…', snapshot:'snapshot…',
+                     auth_wait:'waiting 30 min (login failed, lockout cooldown)…',
+                     network_wait:'network down, reconnecting…'};
 let busy = false;
 
 function switchTimeMode(mode){
@@ -824,6 +831,8 @@ async function repairLegacies(){
 function statusCell(c){
   if (c.ok === true) return ['ok', 'OK'];
   if (c.stage === 'cancelled') return ['cancelled', 'stopped'];
+  if (c.stage === 'auth_wait') return ['auth-warn', '⚠️ Auth Lockout (Waiting 30m)'];
+  if (c.stage === 'network_wait') return ['net-warn', '⚡ Network Down (Reconnecting…)'];
   if (c.ok === false) return ['fail', 'FAIL' + (c.error ? ': ' + c.error : '')];
   return ['pending', STAGE_LABEL[c.stage] || c.stage];
 }
@@ -845,6 +854,18 @@ function fmtDur(sec){
 }
 
 function renderProgress(s){
+  const cams = Object.values(s.cameras || {});
+  const authCount = cams.filter(c => c.stage === 'auth_wait').length;
+  const netCount = cams.filter(c => c.stage === 'network_wait').length;
+  const banner = document.getElementById('warningBanner');
+  if (banner) {
+    if (authCount || netCount) {
+      banner.style.display = 'block';
+      banner.textContent = `⚠️ Warning: ${authCount ? authCount + ' camera(s) waiting 30m auth cooldown. ' : ''}${netCount ? netCount + ' camera(s) waiting for network reconnect.' : ''}`.trim();
+    } else {
+      banner.style.display = 'none';
+    }
+  }
   const pct = Math.round(100 * (s.fraction || 0));
   document.getElementById('progressFill').style.width = pct + '%';
   const text = document.getElementById('progressText');

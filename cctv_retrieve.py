@@ -21,10 +21,12 @@ import argparse
 import collections
 import concurrent.futures
 import csv
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -48,6 +50,8 @@ DEFAULT_STREAM_SUFFIX = 1  # main stream sub-index appended to channel number
 DEFAULT_WORKERS = 4        # measured: 4 parallel downloads from different NVRs saturate the ~1 Gbps link
 DEFAULT_PER_NVR = 2        # measured: one NVR tops out around 500 Mbps total
 DEFAULT_TIMEOUT_S = 30
+DEFAULT_PASSWORDS = ["admin", "Mc158806"]
+AUTH_LOCKOUT_WAIT_S = int(os.environ.get("AUTH_LOCKOUT_WAIT_S", 30 * 60))
 DOWNLOAD_CHUNK = 1 << 20
 ISAPI_NS = "{http://www.isapi.org/ver20/XMLSchema}"
 SEGMENTS_DIRNAME = ".segments"
@@ -305,33 +309,118 @@ class IsapiError(Exception):
 
 
 class NvrClient:
-    def __init__(self, host, user, password, timeout=DEFAULT_TIMEOUT_S, port=HTTP_PORT):
+    def __init__(self, host, user, password=None, timeout=DEFAULT_TIMEOUT_S, port=HTTP_PORT):
         self.base = f"http://{host}:{port}"
         self.host = host
+        self.port = int(port)
         self.user = user
-        self.password = password
         self.timeout = timeout
+        if not password:
+            self.passwords = list(DEFAULT_PASSWORDS)
+        else:
+            candidates = [str(p) for p in password] if isinstance(password, (list, tuple)) else [str(password)]
+            passwords = []
+            for p in candidates + DEFAULT_PASSWORDS:
+                if p and p not in passwords:
+                    passwords.append(p)
+            self.passwords = passwords or list(DEFAULT_PASSWORDS)
+        self.active_password = self.passwords[0] if self.passwords else ""
+        self.password = self.active_password
 
-    def _open(self, path, body):
-        # A fresh opener per request: urllib's digest handler keeps a retry counter that is not thread-safe.
-        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        mgr.add_password(None, self.base + "/", self.user, self.password)
-        opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
-        req = urllib.request.Request(self.base + path, body.encode(), {"Content-Type": "application/xml"})
+    def check_network(self):
         try:
-            return opener.open(req, timeout=self.timeout)
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise IsapiError(f"NVR {self.host} rejected the username/password (HTTP 401)") from e
-            raise IsapiError(f"NVR {self.host} {path} returned HTTP {e.code}") from e
-        except (urllib.error.URLError, OSError) as e:
-            raise IsapiError(f"cannot reach NVR {self.host}: {getattr(e, 'reason', e)}") from e
+            sock = socket.create_connection((self.host, self.port), timeout=3)
+            sock.close()
+            return True
+        except (socket.error, OSError, TimeoutError):
+            return False
 
-    def search(self, track_id, start, end):
+    def poll_network_until_connected(self, cancel_event=None, on_status=None, poll_interval=5):
+        if self.check_network():
+            return
+        while True:
+            check_cancel(cancel_event)
+            if on_status:
+                on_status(f"NVR {self.host} unreachable (network down). Polling every {poll_interval}s until connection restored...")
+            elapsed = 0.0
+            while elapsed < poll_interval:
+                check_cancel(cancel_event)
+                step = min(0.5, max(0.0, poll_interval - elapsed))
+                if step > 0:
+                    time.sleep(step)
+                elapsed += step
+                if step <= 0:
+                    break
+            check_cancel(cancel_event)
+            if self.check_network():
+                break
+        if on_status:
+            on_status(f"Network connection restored to NVR {self.host}. Resuming data retrieval...")
+
+    def wait_auth_lockout(self, cancel_event=None, on_status=None, wait_seconds=None):
+        wait_s = wait_seconds if wait_seconds is not None else int(os.environ.get("AUTH_LOCKOUT_WAIT_S", AUTH_LOCKOUT_WAIT_S))
+        wait_s = max(0, int(wait_s))
+        check_cancel(cancel_event)
+        if on_status:
+            on_status(f"Login failed for NVR {self.host} (HTTP 401). Waiting {wait_s // 60} minutes before retrying (account lockout cooldown)...")
+        for rem in range(wait_s, 0, -1):
+            check_cancel(cancel_event)
+            time.sleep(1)
+            check_cancel(cancel_event)
+            remaining = rem - 1
+            if remaining > 0 and on_status:
+                if remaining % 60 == 0:
+                    on_status(f"Login lockout cooldown for NVR {self.host}: {remaining // 60} minutes remaining before retrying (account lockout cooldown)...")
+                elif wait_s < 60 and remaining % 10 == 0:
+                    on_status(f"Login lockout cooldown for NVR {self.host}: {remaining}s remaining before retrying (account lockout cooldown)...")
+
+    def _open(self, path, body, cancel_event=None, on_status=None):
+        data = body.encode() if isinstance(body, str) else body
+
+        while True:
+            candidates = [self.active_password] + [p for p in self.passwords if p != self.active_password]
+            if not candidates:
+                raise IsapiError(f"NVR {self.host} has no password configured")
+
+            last_401 = None
+
+            for candidate in candidates:
+                while True:
+                    check_cancel(cancel_event)
+                    # A fresh opener per request: urllib's digest handler keeps a retry counter that is not thread-safe.
+                    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+                    mgr.add_password(None, self.base + "/", self.user, candidate)
+                    opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
+                    req = urllib.request.Request(self.base + path, data, {"Content-Type": "application/xml"})
+                    try:
+                        resp = opener.open(req, timeout=self.timeout)
+                        if candidate != self.active_password:
+                            self.active_password = candidate
+                            self.password = candidate
+                        return resp
+                    except urllib.error.HTTPError as e:
+                        if e.code == 401:
+                            last_401 = e
+                            break
+                        raise IsapiError(f"NVR {self.host} {path} returned HTTP {e.code}") from e
+                    except (urllib.error.URLError, OSError, TimeoutError) as e:
+                        check_cancel(cancel_event)
+                        self.poll_network_until_connected(cancel_event=cancel_event, on_status=on_status, poll_interval=5)
+                        continue
+
+            # When all candidate passwords in self.passwords have been attempted and all returned HTTP 401:
+            check_cancel(cancel_event)
+            self.wait_auth_lockout(cancel_event=cancel_event, on_status=on_status)
+            if self.passwords:
+                self.active_password = self.passwords[0]
+                self.password = self.active_password
+
+    def search(self, track_id, start, end, cancel_event=None, on_status=None):
         """Recording segments on `track_id` overlapping [start, end), oldest first."""
         search_id = str(uuid.uuid4()).upper()
         segments, position = {}, 0
         while True:
+            check_cancel(cancel_event)
             body = (
                 '<?xml version="1.0" encoding="UTF-8"?><CMSearchDescription>'
                 f"<searchID>{search_id}</searchID>"
@@ -342,7 +431,7 @@ class NvrClient:
                 "<metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList>"
                 "</CMSearchDescription>"
             )
-            with self._open("/ISAPI/ContentMgmt/search", body) as resp:
+            with self._open("/ISAPI/ContentMgmt/search", body, cancel_event=cancel_event, on_status=on_status) as resp:
                 root = ET.fromstring(resp.read())
             status = (root.findtext(ISAPI_NS + "responseStatusStrg") or "").upper()
             items = list(root.iter(ISAPI_NS + "searchMatchItem"))
@@ -368,7 +457,7 @@ class NvrClient:
             position += len(items)
         return sorted(segments.values(), key=lambda s: s.start)
 
-    def download(self, segment, dest, on_bytes=None, on_length=None, cancel_event=None):
+    def download(self, segment, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
         """Stream one whole recording segment to `dest` (the NVR ignores sub-ranges and HTTP Range)."""
         body = ('<?xml version="1.0" encoding="UTF-8"?>'
                 '<downloadRequest version="1.0" xmlns="http://www.isapi.org/ver20/XMLSchema">'
@@ -376,21 +465,30 @@ class NvrClient:
         check_cancel(cancel_event)
         tmp = dest + ".part"
         try:
-            with self._open("/ISAPI/ContentMgmt/download", body) as resp, open(tmp, "wb") as f:
-                length = resp.headers.get("Content-Length")
-                if on_length and length and length.isdigit():
-                    on_length(int(length))
-                while True:
-                    check_cancel(cancel_event)
-                    try:
-                        chunk = resp.read(DOWNLOAD_CHUNK)
-                    except (OSError, TimeoutError) as e:
-                        raise IsapiError(f"download from {self.host} interrupted: {e}") from e
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    if on_bytes:
-                        on_bytes(len(chunk))
+            download_done = False
+            while not download_done:
+                check_cancel(cancel_event)
+                interrupted = False
+                with self._open("/ISAPI/ContentMgmt/download", body, cancel_event=cancel_event, on_status=on_status) as resp, open(tmp, "wb") as f:
+                    length = resp.headers.get("Content-Length")
+                    if on_length and length and length.isdigit():
+                        on_length(int(length))
+                    while True:
+                        check_cancel(cancel_event)
+                        try:
+                            chunk = resp.read(DOWNLOAD_CHUNK)
+                        except (OSError, TimeoutError, http.client.IncompleteRead):
+                            check_cancel(cancel_event)
+                            self.poll_network_until_connected(cancel_event=cancel_event, on_status=on_status, poll_interval=5)
+                            interrupted = True
+                            break
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        if on_bytes:
+                            on_bytes(len(chunk))
+                if not interrupted:
+                    download_done = True
             os.replace(tmp, dest)
         finally:
             if os.path.exists(tmp):
@@ -422,7 +520,7 @@ class CameraPlan:
         return sum(s.size for s in self.segments or [] if s.name not in already_on_disk)
 
 
-def plan_camera(row, client, start, end, mode):
+def plan_camera(row, client, start, end, mode, cancel_event=None, callbacks=None):
     plan = CameraPlan(row=row, key=camera_key(row))
     try:
         plan.track_id = track_id_from_channel(row["channel"])
@@ -432,8 +530,24 @@ def plan_camera(row, client, start, end, mode):
     if mode == "snapshot":
         plan.segments = []
         return plan
+    check_cancel(cancel_event)
+    def on_status(msg):
+        if callbacks:
+            stage = "auth_wait" if "lockout" in msg or "Login failed" in msg else "network_wait"
+            callbacks.stage(plan.key, stage, row, notes=[msg])
+        print(f"  {row.get('name')} [{plan.key}] {msg}", file=sys.stderr, flush=True)
+
     try:
-        plan.segments = client.search(plan.track_id, start, end)
+        try:
+            plan.segments = client.search(plan.track_id, start, end, cancel_event=cancel_event, on_status=on_status)
+        except TypeError as te:
+            if "on_status" in str(te) or "cancel_event" in str(te):
+                plan.segments = client.search(plan.track_id, start, end)
+            else:
+                raise
+    except Cancelled:
+        plan.error = "cancelled"
+        return plan
     except (IsapiError, ET.ParseError, ValueError) as e:
         plan.error = f"search: {e}"
         return plan
@@ -754,6 +868,8 @@ def snapshot_from_clip(clip_path, out_path, proc_registry, cancel_event):
 
 def snapshot_via_rtsp(host, track_id, start, user, password, out_path, timeout_s, proc_registry, cancel_event):
     """Snapshot-only mode: one frame over RTSP playback instead of downloading a whole segment."""
+    if isinstance(password, list):
+        password = password[0] if password else ""
     stamp = start.strftime("%Y%m%dT%H%M%SZ")
     stop = (start + timedelta(seconds=10)).strftime("%Y%m%dT%H%M%SZ")
     q_user = urllib.parse.quote(str(user), safe="")
@@ -771,8 +887,14 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
     cb = callbacks
 
     def report(stage, **info):
-        cb.stage(plan.key, stage, row, errors=list(result["errors"]), notes=list(result["notes"]),
-                 files=list(result["files"]), **info)
+        kwargs = dict(errors=list(result["errors"]), notes=list(result["notes"]), files=list(result["files"]))
+        kwargs.update(info)
+        cb.stage(plan.key, stage, row, **kwargs)
+
+    def on_status(msg):
+        stage = "auth_wait" if "lockout" in msg or "Login failed" in msg else "network_wait"
+        report(stage, notes=[msg])
+        print(f"  {row.get('name')} [{plan.key}] {msg}", file=sys.stderr, flush=True)
 
     work_dir = os.path.join(run_dir, safe_name(plan.key))
     try:
@@ -787,7 +909,8 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                 report("ok")
                 return result
             report("snapshot")
-            ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, args.password,
+            active_pass = getattr(client, "active_password", args.password)
+            ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, active_pass,
                                         base + ".jpg", args.timeout, proc_registry, cancel_event)
             if ok:
                 result["files"].append(base + ".jpg")
@@ -884,9 +1007,15 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                 lengths[name] = n
                 report("downloading", expected_bytes=sum(lengths.values()))
 
-            report("downloading", expected_bytes=sum(lengths.values()))
-            client.download(seg, temp_ps, on_bytes=lambda n: cb.bytes(plan.key, n), on_length=on_length,
-                            cancel_event=cancel_event)
+            try:
+                client.download(seg, temp_ps, on_bytes=lambda n: cb.bytes(plan.key, n), on_length=on_length,
+                                cancel_event=cancel_event, on_status=on_status)
+            except TypeError as te:
+                if "on_status" in str(te):
+                    client.download(seg, temp_ps, on_bytes=lambda n: cb.bytes(plan.key, n), on_length=on_length,
+                                    cancel_event=cancel_event)
+                else:
+                    raise
 
             if args.trim:
                 seg_paths[seg.name] = temp_ps
@@ -932,7 +1061,8 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                 ok, err = snapshot_from_clip(base + ".mp4", base + ".jpg", proc_registry, cancel_event)
             else:
                 # Raw segments start long before the window; RTSP playback gives an exact frame quickly.
-                ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, args.password,
+                active_pass = getattr(client, "active_password", args.password)
+                ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, active_pass,
                                             base + ".jpg", args.timeout, proc_registry, cancel_event)
             if ok:
                 result["files"].append(base + ".jpg")
@@ -1001,7 +1131,8 @@ def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_re
     for row in rows:
         callbacks.stage(camera_key(row), "searching", row)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        plans = list(pool.map(lambda r: plan_camera(r, clients[r["nvr"].strip()], start, end, args.mode), rows))
+        plans = list(pool.map(lambda r: plan_camera(r, clients[r["nvr"].strip()], start, end, args.mode,
+                                                    cancel_event=cancel_event, callbacks=callbacks), rows))
         list(pool.map(lambda p: mark_existing(p, args, start, end), plans))
 
     results = []
@@ -1011,7 +1142,8 @@ def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_re
             results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
                             "channel": plan.row["channel"].strip(), "ok": False,
                             "errors": [plan.error], "notes": [], "files": []})
-            callbacks.stage(plan.key, "fail", plan.row, errors=[plan.error], notes=[], files=[])
+            callbacks.stage(plan.key, "cancelled" if plan.error == "cancelled" else "fail",
+                            plan.row, errors=[plan.error], notes=[], files=[])
         else:
             callbacks.stage(plan.key, "queued", plan.row, expected_bytes=plan.expected_bytes)
             pending.append(plan)
@@ -1123,7 +1255,7 @@ def main():
 
     cfg = load_config_env(CONFIG_ENV_PATH)
     args.user = args.user or os.environ.get("NVR_USER") or cfg.get("NVR_USER") or "admin"
-    args.password = args.password or os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or "admin"
+    args.password = args.password or os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or DEFAULT_PASSWORDS
 
     try:
         windows = resolve_windows(
@@ -1159,6 +1291,10 @@ def main():
         def stage(self, key, stage, row, **info):
             if stage in ("ok", "fail", "cancelled") or (stage == "queued" and info.get("expected_bytes")):
                 extra = f" ({info['expected_bytes'] / 1e9:.2f} GB to download)" if stage == "queued" else ""
+                print(f"  {row.get('name')} [{key}] {stage}{extra}", flush=True)
+            elif stage in ("network_wait", "auth_wait"):
+                notes = info.get("notes", [])
+                extra = f": {'; '.join(notes)}" if notes else ""
                 print(f"  {row.get('name')} [{key}] {stage}{extra}", flush=True)
 
     def on_window(idx, total, start, end):
