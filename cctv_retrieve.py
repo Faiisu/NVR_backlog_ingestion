@@ -4,9 +4,9 @@ Download recorded CCTV footage from Hikvision NVR storage over ISAPI.
 
 For each camera: search the NVR's recordings for the requested window
 (/ISAPI/ContentMgmt/search) and download every overlapping recording segment at
-full network speed (/ISAPI/ContentMgmt/download), saved as-is. With --trim the
-segments are instead cut and joined into one clip covering exactly the window
-(ffmpeg stream copy, no re-encode).
+full network speed (/ISAPI/ContentMgmt/download), remuxed into real MP4 containers
+(ffmpeg stream copy, no re-encode). With --trim the segments are instead cut and joined
+into one clip covering exactly the window (ffmpeg stream copy, no re-encode).
 
 Times sent to the NVR are its own local clock time. These NVRs label local time
 with a 'Z' suffix (verified 2026-09-16 against the on-screen clock), so requested
@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
@@ -143,6 +143,63 @@ def resolve_window(start, end, last_minutes, tz_offset_hours):
     return start_dt, end_dt
 
 
+def parse_time_str(s):
+    if isinstance(s, dtime):
+        return s
+    s = str(s).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            pass
+    raise ValueError(f"Invalid time format: {s!r}, expected HH:MM or HH:MM:SS")
+
+
+def parse_date_str(s):
+    if isinstance(s, date):
+        return s
+    return datetime.strptime(str(s).strip(), "%Y-%m-%d").date()
+
+
+def resolve_daily_windows(start_date_str, end_date_str, start_time_str, end_time_str):
+    """Generate a list of (start_dt, end_dt) for each day in [start_date, end_date].
+    Supports both same-day windows (e.g. 10:00 to 22:00) and overnight windows (e.g. 22:00 to 04:00).
+    """
+    d_start = parse_date_str(start_date_str)
+    d_end = parse_date_str(end_date_str)
+    if d_end < d_start:
+        raise ValueError("end_date must be on or after start_date")
+    if (d_end - d_start).days > 90:
+        raise ValueError("date range cannot exceed 90 days")
+    t_start = parse_time_str(start_time_str)
+    t_end = parse_time_str(end_time_str)
+    if t_start == t_end:
+        raise ValueError("daily start time and end time cannot be the same")
+
+    windows = []
+    curr = d_start
+    overnight = t_start > t_end
+    while curr <= d_end:
+        w_start = datetime.combine(curr, t_start)
+        w_end = datetime.combine(curr + timedelta(days=1 if overnight else 0), t_end)
+        windows.append((w_start, w_end))
+        curr += timedelta(days=1)
+    return windows
+
+
+def resolve_windows(start=None, end=None, last_minutes=5, tz_offset_hours=7,
+                    start_date=None, end_date=None, daily_start=None, daily_end=None):
+    """Return list of (start_dt, end_dt) tuples on the NVR local clock.
+    If daily parameters are given, returns a window per day. Otherwise returns [(start, end)].
+    """
+    if start_date or end_date or daily_start or daily_end:
+        if not (start_date and end_date and daily_start and daily_end):
+            raise ValueError("start-date, end-date, daily-start, and daily-end must all be provided together")
+        return resolve_daily_windows(start_date, end_date, daily_start, daily_end)
+    s, e = resolve_window(start, end, last_minutes, tz_offset_hours)
+    return [(s, e)]
+
+
 def output_base(row, start_dt, output_dir):
     """<output_dir>/<YYYY-MM-DD>/<camera>/<YYYYMMDD_HHMMSS>_<camera>_<channel> (NVR local time, no extension)."""
     cam = safe_name(row.get("name") or "cam")
@@ -153,8 +210,8 @@ def output_base(row, start_dt, output_dir):
 def raw_segment_path(row, segment, output_dir):
     """<output_dir>/<YYYY-MM-DD>/<camera>/<segment start>-<segment end>_<camera>_<channel>.mp4
 
-    The file is the NVR's own download format (MPEG-PS with a Hikvision header, what the NVR's web UI
-    also saves as .mp4); it plays in VLC and reads with ffmpeg.
+    The segment is remuxed from the NVR's download format into a standard MP4 container
+    with ffmpeg stream copy (no re-encode); it plays in Windows Media Player, VLC, and browsers.
     """
     cam = safe_name(row.get("name") or "cam")
     folder = os.path.join(output_dir, segment.start.strftime("%Y-%m-%d"), cam)
@@ -349,14 +406,17 @@ class CameraPlan:
     track_id: int = 0
     segments: list = None
     error: str = None
-    existing: set = None      # names of segments already saved in the output folder (trim off)
-    clip_exists: bool = False  # trimmed clip for this window already in the output folder (trim on)
+    existing: set = None      # names of segments already saved in output folder as real MP4 (trim off)
+    legacy: set = None        # names of segments saved on disk as legacy non-MP4 (trim off)
+    clip_exists: bool = False  # trimmed clip for this window already in output folder as real MP4 (trim on)
+    legacy_clip: bool = False # trimmed clip exists on disk but is legacy non-MP4 (trim on)
 
     @property
     def expected_bytes(self):
-        if self.clip_exists:
+        if self.clip_exists or self.legacy_clip:
             return 0
-        return sum(s.size for s in self.segments or [] if s.name not in (self.existing or ()))
+        already_on_disk = (self.existing or set()) | (self.legacy or set())
+        return sum(s.size for s in self.segments or [] if s.name not in already_on_disk)
 
 
 def plan_camera(row, client, start, end, mode):
@@ -388,6 +448,21 @@ def file_done(path):
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
 
+def is_real_mp4(path):
+    """Check whether `path` is a genuine MP4 container (ISO BMFF).
+    Legacy files downloaded directly from Hikvision NVR are MPEG-PS streams named .mp4;
+    they start with IMKH/HKMI or MPEG-PS pack headers (00 00 01 BA) instead of an 'ftyp' or 'moov' box.
+    """
+    if not os.path.isfile(path) or os.path.getsize(path) < 16:
+        return False
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        return len(header) >= 8 and header[4:8] in (b"ftyp", b"moov")
+    except OSError:
+        return False
+
+
 def media_duration(path):
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -398,7 +473,10 @@ def media_duration(path):
 
 
 def mark_existing(plan, args, start, end):
-    """Record which outputs of this plan are already in the output folder, so they aren't downloaded again."""
+    """Record which outputs of this plan are already in the output folder, so they aren't downloaded again.
+    Also inspects existing files: genuine MP4 files are skipped, while legacy non-MP4 files (e.g. from
+    older runs) are flagged so they can be converted in-place without re-downloading from NVR.
+    """
     if plan.error or not plan.segments:
         return
     if args.trim:
@@ -407,9 +485,21 @@ def mark_existing(plan, args, start, end):
         clip = output_base(plan.row, start, args.output_dir) + ".mp4"
         if file_done(clip):
             dur, covered = media_duration(clip), covered_seconds(plan, start, end)
-            plan.clip_exists = dur is not None and covered - 2 <= dur <= covered + 10
+            if dur is not None and covered - 2 <= dur <= covered + 10:
+                if is_real_mp4(clip):
+                    plan.clip_exists = True
+                else:
+                    plan.legacy_clip = True
     else:
-        plan.existing = {s.name for s in plan.segments if file_done(raw_segment_path(plan.row, s, args.output_dir))}
+        plan.existing = set()
+        plan.legacy = set()
+        for s in plan.segments:
+            p = raw_segment_path(plan.row, s, args.output_dir)
+            if file_done(p):
+                if is_real_mp4(p):
+                    plan.existing.add(s.name)
+                else:
+                    plan.legacy.add(s.name)
 
 
 def trim_parts(plan, start, end, seg_paths):
@@ -422,6 +512,99 @@ def trim_parts(plan, start, end, seg_paths):
     return parts
 
 
+def probe_video_codec(path):
+    """Return video codec name (e.g. 'h264', 'hevc') or empty string if undetectable."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", path],
+                             capture_output=True, text=True, timeout=15)
+        return out.stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def remux_to_mp4(src_path, out_path, proc_registry, cancel_event):
+    """Stream-copy one raw recording segment (.ps) into a standard MP4 container.
+    Written to a temp name first so a failure never leaves a file that looks complete."""
+    tmp_out = out_path + ".part.mp4"
+    timeout = 600
+    codec = probe_video_codec(src_path)
+    cmd = ["ffmpeg", "-y", "-i", src_path, "-map", "0:v:0", "-c", "copy"]
+    if codec in ("hevc", "h265"):
+        cmd.extend(["-tag:v", "hvc1"])
+    cmd.extend(["-movflags", "+faststart", tmp_out])
+    try:
+        ok, err = run_ffmpeg(cmd, timeout, proc_registry, cancel_event)
+        if not ok:
+            return False, err
+        os.replace(tmp_out, out_path)
+        return True, ""
+    finally:
+        if os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+
+def repair_legacy_file(path, proc_registry=None, cancel_event=None):
+    """If `path` is not a genuine MP4 container (e.g. legacy Hikvision MPEG-PS),
+    remux it in-place to a standard MP4 container.
+    Returns (ok: bool, message: str).
+    """
+    if is_real_mp4(path):
+        return True, "already genuine MP4"
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False, "file does not exist or is empty"
+    ok, err = remux_to_mp4(path, path, proc_registry, cancel_event)
+    if not ok:
+        return False, err
+    return True, "converted to genuine MP4"
+
+
+def scan_and_repair_legacies(root_dir, proc_registry=None, cancel_event=None, on_file=None):
+    """Walk `root_dir` to find any .mp4 files that are legacy non-MP4 containers (MPEG-PS),
+    and remux them in-place to genuine MP4 containers.
+    Returns dict(total=..., legacy=..., repaired=..., failed=..., errors=[...]).
+    """
+    stats = {"total": 0, "legacy": 0, "repaired": 0, "failed": 0, "errors": []}
+    if not os.path.exists(root_dir):
+        return stats
+
+    mp4_files = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fname in filenames:
+            if fname.lower().endswith(".mp4") and not fname.lower().endswith(".part.mp4"):
+                mp4_files.append(os.path.join(dirpath, fname))
+
+    stats["total"] = len(mp4_files)
+    for i, path in enumerate(sorted(mp4_files), 1):
+        check_cancel(cancel_event)
+        if not file_done(path):
+            continue
+        if not is_real_mp4(path):
+            stats["legacy"] += 1
+            if on_file:
+                on_file(i, len(mp4_files), path, "converting")
+            try:
+                ok, err = repair_legacy_file(path, proc_registry, cancel_event)
+            except Exception as exc:
+                ok, err = False, str(exc)
+            if ok:
+                stats["repaired"] += 1
+                if on_file:
+                    on_file(i, len(mp4_files), path, "ok")
+            else:
+                stats["failed"] += 1
+                stats["errors"].append(f"{path}: {err}")
+                if on_file:
+                    on_file(i, len(mp4_files), path, f"failed: {err}")
+        else:
+            if on_file:
+                on_file(i, len(mp4_files), path, "already_mp4")
+    return stats
+
+
 def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
     """Stream-copy the covered pieces into one mp4. Written to a temp name first so a failure never
     leaves a file that looks complete."""
@@ -430,14 +613,21 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
     try:
         if len(parts) == 1:
             src, offset, dur = parts[0]
-            ok, err = run_ffmpeg(["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
-                                  "-map", "0:v:0", "-c", "copy", "-movflags", "+faststart", tmp_out],
-                                 timeout, proc_registry, cancel_event)
+            codec = probe_video_codec(src)
+            cmd = ["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
+                   "-map", "0:v:0", "-c", "copy"]
+            if codec in ("hevc", "h265"):
+                cmd.extend(["-tag:v", "hvc1"])
+            cmd.extend(["-movflags", "+faststart", tmp_out])
+            ok, err = run_ffmpeg(cmd, timeout, proc_registry, cancel_event)
             if not ok:
                 return False, err
         else:
             pieces = []
+            codec = ""
             for i, (src, offset, dur) in enumerate(parts):
+                if not codec:
+                    codec = probe_video_codec(src)
                 piece = os.path.join(work_dir, f"piece{i}.ts")
                 ok, err = run_ffmpeg(["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
                                       "-map", "0:v:0", "-c", "copy", "-f", "mpegts", piece],
@@ -445,16 +635,21 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
                 if not ok:
                     return False, err
                 pieces.append(piece)
-            ok, err = run_ffmpeg(["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0",
-                                  "-c", "copy", "-movflags", "+faststart", tmp_out],
-                                 timeout, proc_registry, cancel_event)
+            cmd = ["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0", "-c", "copy"]
+            if codec in ("hevc", "h265"):
+                cmd.extend(["-tag:v", "hvc1"])
+            cmd.extend(["-movflags", "+faststart", tmp_out])
+            ok, err = run_ffmpeg(cmd, timeout, proc_registry, cancel_event)
             if not ok:
                 return False, err
         os.replace(tmp_out, out_path)
         return True, ""
     finally:
         if os.path.exists(tmp_out):
-            os.remove(tmp_out)
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
 
 
 def snapshot_from_clip(clip_path, out_path, proc_registry, cancel_event):
@@ -507,33 +702,70 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             report("ok" if result["ok"] else "fail")
             return result
 
-        # Without trimming, segments are saved straight to their final place; with it they go to scratch.
-        if args.trim:
-            os.makedirs(work_dir, exist_ok=True)
+        # Both modes use work_dir as scratch for downloading temp segments.
+        os.makedirs(work_dir, exist_ok=True)
         need = plan.expected_bytes
-        # os.path.dirname(base) may not exist yet when trim=False (each segment dir is created just
-        # before downloading). Fall back to output_dir which is always present at this point.
-        disk_check_dir = work_dir if args.trim else args.output_dir
+        disk_check_dir = args.output_dir
         free = shutil.disk_usage(disk_check_dir).free
         if need * 1.1 > free:
             raise IsapiError(f"not enough disk space: need ~{need / 1e9:.1f} GB, {free / 1e9:.1f} GB free")
 
         existing = plan.existing or set()
+        legacy = plan.legacy or set()
         if existing:
             result["notes"].append(f"{len(existing)} of {len(plan.segments)} recording file(s) "
-                                   "already in output folder, skipped")
+                                   "already in output folder (MP4), skipped")
+        if legacy:
+            result["notes"].append(f"detected {len(legacy)} legacy recording file(s) on disk (converting in-place)")
+
         if plan.clip_exists:
-            result["notes"].append("clip already in output folder, skipped")
-        seg_paths, lengths = {}, {s.name: s.size for s in plan.segments if s.name not in existing}
-        for seg in [] if plan.clip_exists else plan.segments:
-            if args.trim:
-                dest = os.path.join(work_dir, f"{safe_name(seg.name)}.ps")
+            result["notes"].append("clip already in output folder (MP4), skipped")
+        elif plan.legacy_clip:
+            result["notes"].append("clip detected as legacy non-MP4 (converting in-place)")
+            report("remuxing")
+            ok, err = remux_to_mp4(base + ".mp4", base + ".mp4", proc_registry, cancel_event)
+            if ok:
+                result["notes"].append(f"converted legacy clip to MP4: {os.path.basename(base + '.mp4')}")
+                plan.clip_exists = True
             else:
-                dest = raw_segment_path(row, seg, args.output_dir)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                result["notes"].append(f"failed to convert legacy clip ({err}), regenerating clip")
+                try:
+                    os.remove(base + ".mp4")
+                except OSError:
+                    pass
+
+        seg_paths, lengths = {}, {s.name: s.size for s in plan.segments if s.name not in existing and s.name not in legacy}
+        for seg in [] if plan.clip_exists else plan.segments:
+            temp_ps = os.path.join(work_dir, f"{safe_name(seg.name)}.ps")
+            dest_final = raw_segment_path(row, seg, args.output_dir)
+            if not args.trim:
+                os.makedirs(os.path.dirname(dest_final), exist_ok=True)
+
             if seg.name in existing:
-                seg_paths[seg.name] = dest
-                result["files"].append(dest)
+                seg_paths[seg.name] = dest_final
+                if dest_final not in result["files"]:
+                    result["files"].append(dest_final)
+                continue
+
+            if not args.trim and seg.name in legacy:
+                report("remuxing")
+                ok, err = remux_to_mp4(dest_final, dest_final, proc_registry, cancel_event)
+                if ok:
+                    if dest_final not in result["files"]:
+                        result["files"].append(dest_final)
+                    result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                    seg_paths[seg.name] = dest_final
+                    continue
+                else:
+                    result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
+                    try:
+                        os.remove(dest_final)
+                    except OSError:
+                        pass
+                    lengths[seg.name] = seg.size
+
+            if args.trim and file_done(dest_final):
+                seg_paths[seg.name] = dest_final
                 continue
 
             def on_length(n, name=seg.name):
@@ -541,11 +773,25 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                 report("downloading", expected_bytes=sum(lengths.values()))
 
             report("downloading", expected_bytes=sum(lengths.values()))
-            client.download(seg, dest, on_bytes=lambda n: cb.bytes(plan.key, n), on_length=on_length,
+            client.download(seg, temp_ps, on_bytes=lambda n: cb.bytes(plan.key, n), on_length=on_length,
                             cancel_event=cancel_event)
-            seg_paths[seg.name] = dest
-            if not args.trim:
-                result["files"].append(dest)
+
+            if args.trim:
+                seg_paths[seg.name] = temp_ps
+            else:
+                report("remuxing")
+                ok, err = remux_to_mp4(temp_ps, dest_final, proc_registry, cancel_event)
+                if not ok:
+                    result["ok"] = False
+                    result["errors"].append(f"remux: {err}")
+                    report("fail")
+                    return result
+                if dest_final not in result["files"]:
+                    result["files"].append(dest_final)
+                try:
+                    os.remove(temp_ps)
+                except OSError:
+                    pass
 
         covered = covered_seconds(plan, start, end)
         wanted = (end - start).total_seconds()
@@ -553,13 +799,15 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             result["notes"].append(f"recording covers {covered:.0f}s of {wanted:.0f}s requested (gaps on NVR)")
 
         if plan.clip_exists:
-            result["files"].append(base + ".mp4")
+            if (base + ".mp4") not in result["files"]:
+                result["files"].append(base + ".mp4")
         elif args.trim:
             parts = trim_parts(plan, start, end, seg_paths)
             report("cutting")
             ok, err = cut_clip(parts, base + ".mp4", proc_registry, cancel_event, work_dir)
             if ok:
-                result["files"].append(base + ".mp4")
+                if (base + ".mp4") not in result["files"]:
+                    result["files"].append(base + ".mp4")
             else:
                 result["ok"] = False
                 result["errors"].append(f"clip: {err}")
@@ -688,6 +936,19 @@ def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_re
     return results
 
 
+def run_windows(rows, args, windows, callbacks=None, cancel_event=None, proc_registry=None, on_window=None):
+    """Run ingestion sequentially across multiple (start, end) windows (e.g. daily recurring windows)."""
+    all_results = []
+    for idx, (start, end) in enumerate(windows, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if on_window:
+            on_window(idx, len(windows), start, end)
+        results = run_batch(rows, args, start, end, callbacks, cancel_event, proc_registry)
+        all_results.extend(results)
+    return all_results
+
+
 def write_run_log(results, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
@@ -710,6 +971,10 @@ def main():
                     help="If --start/--end omitted, fetch the last N minutes up to now (default 5)")
     ap.add_argument("--tz-offset-hours", type=float, default=float(os.environ.get("TZ_OFFSET_HOURS", 7)),
                     help="NVR clock timezone vs UTC, used only to compute 'now' for --last-minutes (default 7)")
+    ap.add_argument("--start-date", help="Start date 'YYYY-MM-DD' for daily recurring window")
+    ap.add_argument("--end-date", help="End date 'YYYY-MM-DD' for daily recurring window")
+    ap.add_argument("--daily-start", help="Daily start time 'HH:MM[:SS]' (e.g. 10:00:00)")
+    ap.add_argument("--daily-end", help="Daily end time 'HH:MM[:SS]' (e.g. 22:00:00)")
     ap.add_argument("--mode", choices=["snapshot", "clip", "both"], default="both")
     ap.add_argument("--output-dir", default="output")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Max parallel downloads overall")
@@ -720,14 +985,36 @@ def main():
                          "(default: save the NVR's recording files as-is)")
     ap.add_argument("--user", default=None, help="NVR username (default from config.env / env NVR_USER)")
     ap.add_argument("--password", default=None, help="NVR password (default from config.env / env NVR_PASSWORD)")
+    ap.add_argument("--repair-legacies", nargs="?", const="output", default=None,
+                    help="Scan output directory (or specified folder) and convert all legacy non-MP4 files in-place to genuine MP4")
     args = ap.parse_args()
+
+    if args.repair_legacies is not None:
+        target_dir = args.repair_legacies or args.output_dir
+        if not os.path.exists(target_dir):
+            sys.exit(f"Directory not found: {target_dir}")
+        print(f"Scanning '{target_dir}' for legacy non-MP4 files...")
+        def on_repair_file(idx, total, path, status):
+            if status == "converting":
+                print(f"  [{idx}/{total}] Converting: {path}...", end="", flush=True)
+            elif status == "ok":
+                print(" OK")
+            elif status.startswith("failed:"):
+                print(f" FAIL ({status})")
+        stats = scan_and_repair_legacies(target_dir, on_file=on_repair_file)
+        print(f"\nDone: scanned {stats['total']} file(s). Found {stats['legacy']} legacy file(s): "
+              f"{stats['repaired']} converted to genuine MP4, {stats['failed']} failed.")
+        sys.exit(0 if stats["failed"] == 0 else 1)
 
     cfg = load_config_env(CONFIG_ENV_PATH)
     args.user = args.user or os.environ.get("NVR_USER") or cfg.get("NVR_USER") or "admin"
     args.password = args.password or os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or "admin"
 
     try:
-        start, end = resolve_window(args.start, args.end, args.last_minutes, args.tz_offset_hours)
+        windows = resolve_windows(
+            start=args.start, end=args.end, last_minutes=args.last_minutes, tz_offset_hours=args.tz_offset_hours,
+            start_date=args.start_date, end_date=args.end_date, daily_start=args.daily_start, daily_end=args.daily_end,
+        )
     except ValueError as e:
         sys.exit(str(e))
 
@@ -741,7 +1028,12 @@ def main():
     if not rows:
         sys.exit("No enabled online cameras found in CSV")
 
-    print(f"Window (NVR local time): {start} -> {end}")
+    if len(windows) == 1:
+        print(f"Window (NVR local time): {windows[0][0]} -> {windows[0][1]}")
+    else:
+        print(f"Daily Recurring Windows: {len(windows)} day(s) "
+              f"({windows[0][0].strftime('%Y-%m-%d')} to {windows[-1][0].strftime('%Y-%m-%d')}, "
+              f"daily {windows[0][0].strftime('%H:%M:%S')} -> {windows[0][1].strftime('%H:%M:%S')})")
     print(f"Cameras: {len(rows)} (mode={args.mode}, workers={args.workers}, per NVR={args.per_nvr}, "
           f"{'trim to window' if args.trim else 'whole recording files'})")
 
@@ -751,8 +1043,12 @@ def main():
                 extra = f" ({info['expected_bytes'] / 1e9:.2f} GB to download)" if stage == "queued" else ""
                 print(f"  {row.get('name')} [{key}] {stage}{extra}", flush=True)
 
+    def on_window(idx, total, start, end):
+        if total > 1:
+            print(f"\n--- Day {idx}/{total}: {start} -> {end} ---", flush=True)
+
     t0 = time.time()
-    results = run_batch(rows, args, start, end, ConsoleCallbacks())
+    results = run_windows(rows, args, windows, ConsoleCallbacks(), on_window=on_window)
 
     ok_count = sum(1 for r in results if r["ok"])
     print(f"\nDone in {time.time() - t0:.0f}s: {ok_count}/{len(results)} succeeded")

@@ -26,7 +26,8 @@ UI_STATE_PATH = os.path.join(BASE_DIR, "webgui_state.json")
 MODES = ("both", "snapshot", "clip")
 UI_DEFAULTS = {"csv": DEFAULT_CSV, "mode": "both", "workers": core.DEFAULT_WORKERS,
                "per_nvr": core.DEFAULT_PER_NVR, "timeout": core.DEFAULT_TIMEOUT_S,
-               "tz_offset_hours": 7, "last_minutes": 5, "start": "", "end": "", "trim": False}
+               "tz_offset_hours": 7, "last_minutes": 5, "start": "", "end": "", "trim": False,
+               "time_mode": "single", "start_date": "", "end_date": "", "daily_start": "10:00", "daily_end": "22:00"}
 FINAL_STAGES = ("ok", "fail", "cancelled")
 SPEED_WINDOW_S = 5
 ETA_WINDOW_S = 20
@@ -80,9 +81,9 @@ def log_line(msg):
 
 
 def short_error(err):
-    """ffmpeg stderr is long; keep the 'snapshot:'/'clip:' prefix plus its last meaningful line."""
+    """ffmpeg stderr is long; keep the 'snapshot:'/'clip:'/'remux:' prefix plus its last meaningful line."""
     prefix, sep, body = err.partition(": ")
-    if not (sep and prefix in ("snapshot", "clip")):
+    if not (sep and prefix in ("snapshot", "clip", "remux")):
         prefix, body = None, err
     lines = [l.strip() for l in body.splitlines() if l.strip()]
     last = lines[-1] if lines else body.strip()
@@ -102,12 +103,16 @@ class GuiCallbacks(core.Callbacks):
             cam["stage"] = stage
             cam["error"] = "; ".join(short_error(e) for e in errors) or None
             cam["note"] = "; ".join(notes) or None
-            cam["files"] = [rel(p) for p in files]
+            if files:
+                for p in files:
+                    rp = rel(p)
+                    if rp not in cam["files"]:
+                        cam["files"].append(rp)
             if expected_bytes is not None:
                 cam["expected"] = expected_bytes
             if stage in ("queued", "fail", "cancelled") and STATE["phase"] == "searching":
                 RUN["searched"] += 1
-                if RUN["searched"] == STATE["total"]:
+                if RUN["searched"] == STATE.get("cams_count", STATE["total"]):
                     STATE["phase"] = "downloading"
                     log_line(f"Search done: {sum(c['expected'] for c in STATE['cameras'].values()) / 1e9:.2f} GB "
                              "of recordings to download")
@@ -289,11 +294,22 @@ def plan_run(payload):
         raise ValueError("NVR timezone must be between -12 and 14")
     last_minutes = _param(payload, "last_minutes", float, "Last N minutes")
     trim = payload.get("trim") is True
+    time_mode = (payload.get("time_mode") or "single").strip()
+    start_date = (payload.get("start_date") or "").strip()
+    end_date = (payload.get("end_date") or "").strip()
+    daily_start = (payload.get("daily_start") or "").strip()
+    daily_end = (payload.get("daily_end") or "").strip()
     start = (payload.get("start") or "").strip()
     end = (payload.get("end") or "").strip()
     csv_path = (payload.get("csv") or "").strip() or DEFAULT_CSV
 
-    start_dt, end_dt = core.resolve_window(start, end, last_minutes, tz)
+    if time_mode == "daily":
+        if not (start_date and end_date and daily_start and daily_end):
+            raise ValueError("Start date, end date, daily start time, and daily end time are all required for daily recurring mode")
+        windows = core.resolve_daily_windows(start_date, end_date, daily_start, daily_end)
+    else:
+        start_dt, end_dt = core.resolve_window(start, end, last_minutes, tz)
+        windows = [(start_dt, end_dt)]
     try:
         rows = core.load_online_rows(csv_path)
     except OSError as e:
@@ -324,18 +340,44 @@ def plan_run(payload):
     args.trim = trim
 
     ui = {"csv": csv_path, "mode": mode, "workers": workers, "per_nvr": per_nvr, "timeout": timeout,
-          "tz_offset_hours": tz, "last_minutes": last_minutes, "start": start, "end": end, "trim": trim}
-    return {"rows": rows, "args": args, "start": start_dt, "end": end_dt, "ui": ui}
+          "tz_offset_hours": tz, "last_minutes": last_minutes, "start": start, "end": end, "trim": trim,
+          "time_mode": time_mode, "start_date": start_date, "end_date": end_date,
+          "daily_start": daily_start, "daily_end": daily_end}
+    return {"rows": rows, "args": args, "windows": windows, "ui": ui}
 
 
 def do_run(plan):
     finished = threading.Event()
     threading.Thread(target=stats_loop, args=(finished,), daemon=True).start()
+    windows = plan["windows"]
+    total_windows = len(windows)
+    all_results = []
     try:
-        results = core.run_batch(plan["rows"], plan["args"], plan["start"], plan["end"],
-                                 callbacks=GuiCallbacks(), cancel_event=CANCEL_EVENT, proc_registry=REGISTRY)
+        for idx, (w_start, w_end) in enumerate(windows, 1):
+            if CANCEL_EVENT.is_set():
+                break
+            with LOCK:
+                if total_windows > 1:
+                    STATE["window"] = f"[{idx}/{total_windows}] {w_start} -> {w_end} (NVR local time)"
+                    log_line(f"=== Starting Day {idx}/{total_windows}: {w_start} -> {w_end} ===")
+                else:
+                    STATE["window"] = f"{w_start} -> {w_end} (NVR local time)"
+                STATE["phase"] = "searching"
+                RUN["searched"] = 0
+                for row in plan["rows"]:
+                    cam = STATE["cameras"][core.camera_key(row)]
+                    cam["stage"] = "searching"
+                    cam["ok"] = None
+                    cam["error"] = None
+                    cam["note"] = None
+                    cam["expected"] = 0
+
+            w_results = core.run_batch(plan["rows"], plan["args"], w_start, w_end,
+                                       callbacks=GuiCallbacks(), cancel_event=CANCEL_EVENT, proc_registry=REGISTRY)
+            all_results.extend(w_results)
+
         log_path = os.path.join(OUTPUT_DIR, "logs", f"run_{datetime.now():%Y%m%d_%H%M%S}.csv")
-        core.write_run_log(results, log_path)
+        core.write_run_log(all_results, log_path)
         with LOCK:
             STATE["log_file"] = rel(log_path)
             log_line("Run " + ("stopped" if CANCEL_EVENT.is_set() else "finished") + f"; log: {rel(log_path)}")
@@ -461,25 +503,52 @@ tr.off td:last-child{opacity:1}
   <div><label>NVR timezone (hrs)</label><input id="tz_offset_hours" type="number" step="0.5">
     <div class="hint">7 = Thailand; only used for "last N minutes"</div></div>
 </div>
-<div class="row">
-  <div><label>Last N minutes (used if start/end blank)</label><input id="last_minutes" type="number" step="0.5" min="0.5"></div>
-  <div><label>Start (NVR local time)</label><input id="start" type="datetime-local"></div>
-  <div><label>End (NVR local time)</label><input id="end" type="datetime-local"></div>
+<div style="margin:14px 0 8px; display:flex; gap:20px; align-items:center;">
+  <label style="margin:0; font-weight:600; cursor:pointer;"><input type="radio" name="time_mode_radio" value="single" id="tm_single" checked onchange="switchTimeMode('single')"> Single continuous window / Last N min</label>
+  <label style="margin:0; font-weight:600; cursor:pointer;"><input type="radio" name="time_mode_radio" value="daily" id="tm_daily" onchange="switchTimeMode('daily')"> Daily recurring (แยกวันและเวลา เช่น 10,11,12 เวลา 10:00-22:00)</label>
 </div>
-<div class="chips">
-  <span class="hint">End = Start +</span>
-  <button type="button" class="chip" onclick="setDuration(1)">1 min</button>
-  <button type="button" class="chip" onclick="setDuration(5)">5 min</button>
-  <button type="button" class="chip" onclick="setDuration(15)">15 min</button>
-  <button type="button" class="chip" onclick="setDuration(30)">30 min</button>
-  <button type="button" class="chip" onclick="setDuration(60)">1 hr</button>
-  <button type="button" class="chip clear" onclick="clearWindow()">Clear (use last N minutes)</button>
+
+<div id="singleWindowBlock">
+  <div class="row">
+    <div><label>Last N minutes (used if start/end blank)</label><input id="last_minutes" type="number" step="0.5" min="0.5"></div>
+    <div><label>Start (NVR local time)</label><input id="start" type="datetime-local"></div>
+    <div><label>End (NVR local time)</label><input id="end" type="datetime-local"></div>
+  </div>
+  <div class="chips">
+    <span class="hint">End = Start +</span>
+    <button type="button" class="chip" onclick="setDuration(1)">1 min</button>
+    <button type="button" class="chip" onclick="setDuration(5)">5 min</button>
+    <button type="button" class="chip" onclick="setDuration(15)">15 min</button>
+    <button type="button" class="chip" onclick="setDuration(30)">30 min</button>
+    <button type="button" class="chip" onclick="setDuration(60)">1 hr</button>
+    <button type="button" class="chip clear" onclick="clearWindow()">Clear (use last N minutes)</button>
+  </div>
+</div>
+
+<div id="dailyWindowBlock" style="display:none">
+  <div class="row">
+    <div><label>Start Date</label><input id="start_date" type="date"></div>
+    <div><label>End Date</label><input id="end_date" type="date"></div>
+    <div><label>Daily Start Time</label><input id="daily_start" type="time"></div>
+    <div><label>Daily End Time</label><input id="daily_end" type="time"></div>
+  </div>
+  <div class="chips">
+    <span class="hint">Presets:</span>
+    <button type="button" class="chip" onclick="setDailyPreset('10:00','22:00')">10:00 - 22:00</button>
+    <button type="button" class="chip" onclick="setDailyPreset('08:00','18:00')">08:00 - 18:00</button>
+    <button type="button" class="chip" onclick="setDailyPreset('09:00','17:00')">09:00 - 17:00</button>
+    <button type="button" class="chip" onclick="setDailyPreset('22:00','04:00')">22:00 - 04:00 (ข้ามคืน)</button>
+  </div>
+  <div class="hint" style="margin-top:6px;">
+    ระบบจะประมวลผลแยกทีละวัน บันทึกลงโฟลเดอร์ของวันนั้นๆ (เช่น output/2026-09-10/, output/2026-09-11/) และข้ามช่วงกลางคืนที่ไม่ต้องการ
+  </div>
 </div>
 <label class="check"><input id="trim" type="checkbox"> Trim &amp; join to the exact time range</label>
 <div class="hint" id="trimHint"></div>
-<div style="margin-top:12px">
+<div style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
   <button id="runBtn" onclick="startRun()">Run ingestion</button>
   <button id="stopBtn" class="stop" onclick="stopRun()" disabled>Stop</button>
+  <button id="repairBtn" type="button" class="chip" onclick="repairLegacies()">🛠 Scan &amp; Convert Legacy Files</button>
   <span id="runMsg"></span>
 </div>
 </fieldset>
@@ -500,17 +569,35 @@ tr.off td:last-child{opacity:1}
 </fieldset>
 
 <script>
-const FIELDS = ['csv','mode','workers','per_nvr','timeout','tz_offset_hours','last_minutes','start','end'];
+const FIELDS = ['csv','mode','workers','per_nvr','timeout','tz_offset_hours','last_minutes','start','end',
+                'start_date','end_date','daily_start','daily_end'];
 const TRIM_HINT = {
-  false: 'Off: saves the NVR\\'s recording files as-is — every file that overlaps the range, whole (~1 GB per ~70 min per camera). '
+  false: 'Off: downloads whole recording segments and packages them into real MP4 (~1 GB per ~70 min per camera). '
        + 'Output: output/<date>/<camera>/<file start>-<file end>_<camera>_<channel>.mp4',
   true:  'On: downloads those files to a temp folder, cuts and joins them into one clip covering exactly the range, then deletes the originals. '
        + 'Output: output/<date>/<camera>/<start>_<camera>_<channel>.mp4',
 };
 function updateTrimHint(){ document.getElementById('trimHint').textContent = TRIM_HINT[document.getElementById('trim').checked]; }
 const STAGE_LABEL = {searching:'searching recordings…', queued:'queued', downloading:'downloading…',
-                     cutting:'trimming…', snapshot:'snapshot…'};
+                     remuxing:'packaging mp4…', cutting:'trimming…', snapshot:'snapshot…'};
 let busy = false;
+
+function switchTimeMode(mode){
+  const isDaily = mode === 'daily';
+  const rDaily = document.getElementById('tm_daily');
+  const rSingle = document.getElementById('tm_single');
+  if (rDaily) rDaily.checked = isDaily;
+  if (rSingle) rSingle.checked = !isDaily;
+  const sw = document.getElementById('singleWindowBlock');
+  const dw = document.getElementById('dailyWindowBlock');
+  if (sw) sw.style.display = isDaily ? 'none' : 'block';
+  if (dw) dw.style.display = isDaily ? 'block' : 'none';
+}
+
+function setDailyPreset(s, e){
+  document.getElementById('daily_start').value = s;
+  document.getElementById('daily_end').value = e;
+}
 
 async function j(url, opts){ const r = await fetch(url, opts); return await r.json(); }
 function post(url, body){ return j(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); }
@@ -544,9 +631,12 @@ async function loadDefaults(){
   const d = await j('/api/defaults');
   FIELDS.forEach(f => {
     if (d[f] === undefined) return;
-    document.getElementById(f).value = (f === 'start' || f === 'end') ? serverToPicker(d[f]) : d[f];
+    const el = document.getElementById(f);
+    if (!el) return;
+    el.value = (f === 'start' || f === 'end') ? serverToPicker(d[f]) : d[f];
   });
   document.getElementById('trim').checked = d.trim === true;
+  switchTimeMode(d.time_mode || 'single');
   updateTrimHint();
 }
 
@@ -633,10 +723,14 @@ async function startRun(){
   const msg = document.getElementById('runMsg');
   btn.disabled = true; busy = true; msg.textContent = '';
   const body = {};
-  FIELDS.forEach(f => body[f] = document.getElementById(f).value);
+  FIELDS.forEach(f => {
+    const el = document.getElementById(f);
+    if (el) body[f] = el.value;
+  });
   body.start = pickerToServer(body.start);
   body.end = pickerToServer(body.end);
   body.trim = document.getElementById('trim').checked;
+  body.time_mode = document.getElementById('tm_daily').checked ? 'daily' : 'single';
   try {
     const res = await post('/api/run', body);
     if (!res.ok) msg.textContent = res.error;
@@ -647,6 +741,28 @@ async function stopRun(){
   document.getElementById('stopBtn').disabled = true;
   await post('/api/cancel');
   poll();
+}
+
+async function repairLegacies(){
+  if (!confirm('Scan output folder for legacy non-MP4 files and convert them to genuine MP4 in-place?')) return;
+  const btn = document.getElementById('repairBtn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Scanning & Converting…';
+  try {
+    const res = await post('/api/repair-legacies', {});
+    if (res.ok) {
+      alert(`Legacy scan complete!\nScanned: ${res.stats.total} file(s)\nLegacy found: ${res.stats.legacy}\nConverted to genuine MP4: ${res.stats.repaired}\nFailed: ${res.stats.failed}`);
+    } else {
+      alert('Error: ' + res.error);
+    }
+  } catch(e) {
+    alert('Request failed: ' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+    poll();
+  }
 }
 
 function statusCell(c){
@@ -790,8 +906,32 @@ class Handler(BaseHTTPRequestHandler):
             self._toggle_camera(payload)
         elif path == "/api/inventory":
             self._edit_inventory(payload)
+        elif path == "/api/repair-legacies":
+            self._repair_legacies(payload)
         else:
             self._json({"error": "not found"}, 404)
+
+    def _repair_legacies(self, payload):
+        with LOCK:
+            if STATE["running"]:
+                self._json({"ok": False, "error": "Cannot repair files while an ingestion run is in progress"}, 409)
+                return
+        target_dir = (payload.get("dir") or OUTPUT_DIR).strip()
+        if not os.path.isdir(target_dir):
+            self._json({"ok": False, "error": f"Directory not found: {target_dir}"}, 400)
+            return
+        try:
+            log_line(f"Scanning for legacy non-MP4 files in {target_dir}...")
+            def on_repair(idx, total, path, status):
+                if status == "ok":
+                    log_line(f"Repaired legacy file: {os.path.basename(path)}")
+                elif status.startswith("failed:"):
+                    log_line(f"Failed to repair {os.path.basename(path)}: {status}")
+            stats = core.scan_and_repair_legacies(target_dir, on_file=on_repair)
+            log_line(f"Legacy scan complete: {stats['repaired']} file(s) converted to MP4, {stats['failed']} failed.")
+            self._json({"ok": True, "stats": stats})
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
 
     def _list_cameras(self, csv_path):
         try:
@@ -875,12 +1015,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "a run is already in progress"}, 409)
                 return
             args = plan["args"]
+            windows = plan["windows"]
+            total_windows = len(windows)
+            cams_count = len(plan["rows"])
             STATE = fresh_state()
+            if total_windows == 1:
+                win_str = f"{windows[0][0]} -> {windows[0][1]} (NVR local time)"
+            else:
+                win_str = f"{total_windows} day(s): {windows[0][0].date()} to {windows[-1][0].date()} (daily {windows[0][0].strftime('%H:%M:%S')} -> {windows[0][1].strftime('%H:%M:%S')})"
             STATE.update({
                 "running": True, "phase": "searching", "mode": args.mode,
                 "started_at": datetime.now().isoformat(timespec="seconds"),
-                "window": f"{plan['start']} -> {plan['end']} (NVR local time)",
-                "total": len(plan["rows"]),
+                "window": win_str,
+                "total": cams_count * total_windows,
+                "cams_count": cams_count,
             })
             RUN.clear()
             RUN.update({"t0": time.monotonic(), "downloaded": 0, "searched": 0, "samples": collections.deque()})
@@ -891,7 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
                     "bytes": 0, "expected": 0,
                 }
             update_stats()
-            log_line(f"Starting run: {len(plan['rows'])} cameras, mode={args.mode}, "
+            log_line(f"Starting run: {cams_count} cameras, {total_windows} window(s), mode={args.mode}, "
                      f"parallel={args.workers}, per NVR={args.per_nvr}, "
                      + ("trim & join to exact window" if args.trim else "whole recording files"))
             CANCEL_EVENT.clear()

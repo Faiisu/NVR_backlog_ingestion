@@ -11,8 +11,8 @@ For each enabled online camera:
 2. **Download** each overlapping segment in full: `POST /ISAPI/ContentMgmt/download`. This is a file
    transfer at full network speed. The NVR ignores sub-ranges and HTTP `Range`, so a segment is always
    whole (~1 GB per ~70 min per camera).
-3. **Default (trim off):** each segment is saved as-is, named by its own start/end time. Nothing is cut
-   or joined, so the files cover the window plus whatever the segments hold before/after it.
+3. **Default (trim off):** each segment is downloaded and fast-remuxed into a standard `.mp4`
+   container (ffmpeg stream copy, no re-encode, ~1-2 s per GB), named by its own start/end time.
 4. **Trim on** (GUI checkbox "Trim & join to the exact time range", CLI `--trim`): segments go to
    `output/.segments/`, each is cut to its intersection with the window, the pieces are joined in time
    order with ffmpeg stream copy (no re-encode) into one `.mp4`, and the segments are deleted.
@@ -55,6 +55,12 @@ python3 cctv_retrieve.py --csv camera_n_nvr.csv --output-dir output
 python3 cctv_retrieve.py --csv camera_n_nvr.csv \
   --start "2026-09-16 08:00:00" --end "2026-09-16 09:00:00" \
   --mode both --workers 4 --per-nvr 2 --trim --output-dir output
+
+# daily recurring window across dates (e.g. Sept 10, 11, 12 from 10:00 to 22:00)
+python3 cctv_retrieve.py --csv camera_n_nvr.csv \
+  --start-date 2026-09-10 --end-date 2026-09-12 \
+  --daily-start 10:00:00 --daily-end 22:00:00 \
+  --mode both --workers 4 --per-nvr 2 --trim --output-dir output
 ```
 
 ## Web GUI
@@ -80,17 +86,29 @@ output/<date>/<camera>/<YYYYMMDD_HHMMSS>_<camera>_<channel>.mp4                 
 output/<date>/<camera>/<YYYYMMDD_HHMMSS>_<camera>_<channel>.jpg                        snapshot at window start
 output/logs/run_<YYYYMMDD_HHMMSS>.csv    per-camera OK/FAIL/CANCELLED, files, errors, notes
 ```
-Whole segments are the NVR's own download format (MPEG-PS with a Hikvision `IMKH` header, saved as
-`.mp4` like the NVR web UI does); they play in VLC and read with ffmpeg, but some players that expect a
-real MP4 container won't open them. Trimmed clips are real MP4, video-only (the NVR's `pcm_mulaw` audio
-can't be stream-copied into MP4). Cameras sharing a name share a folder; filenames stay unique by channel.
+Whole segments are remuxed from the NVR's download format (MPEG-PS) into standard MP4 containers
+with ffmpeg stream copy (`-c copy -movflags +faststart` and `-tag:v hvc1` for HEVC), ensuring
+compatibility with standard players like Windows Media Player, QuickTime, and browsers. Trimmed
+clips are also real MP4, video-only. Cameras sharing a name share a folder; filenames stay unique by channel.
 
 ## Notes
 - Disabled cameras are kept in `disabled_cameras.json` (keys `<nvr>/<channel>`), separate from the CSV;
   GUI and CLI both skip them.
-- Files already in the output folder are not downloaded again and count as done (noted per camera):
-  whole segments and snapshots by filename, trimmed clips by filename plus a length check (ffprobe),
-  since a trimmed clip's name only carries the window start.
+- Files already in the output folder are inspected during duplicate detection:
+  - If a file is already a **genuine MP4 container**, it is skipped and marked as done.
+  - If a file exists on disk but is a **legacy non-MP4 container** (e.g. raw MPEG-PS from previous versions), it is **automatically converted in-place to real MP4** without re-downloading from the NVR (~1 s per GB).
+  - If in-place conversion of a damaged legacy file fails, the system automatically falls back to re-downloading fresh footage from the NVR.
+- **Legacy repair utility (standalone):**
+  ```bash
+  # Scan and repair all legacy non-MP4 files in output directory:
+  python3 cctv_retrieve.py --repair-legacies output
+
+  # Or click "🛠 Scan & Convert Legacy Files" in the Web GUI.
+  ```
+- **Automated test suite:**
+  ```bash
+  python3 test_cctv.py
+  ```
 - A run checks free disk space before downloading each camera (needs ~1.1x the segment sizes).
 - Clips are written under a temporary name and renamed when complete, so a failed or stopped run never
   leaves a file that looks finished.
