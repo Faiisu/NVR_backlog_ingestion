@@ -71,7 +71,7 @@ def load_config_env(path):
 
 def load_online_rows(csv_path):
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        return [r for r in csv.DictReader(f) if r.get("online", "").strip().upper() == "TRUE"]
+        return [r for r in csv.DictReader(f) if (r.get("online") or "").strip().upper() == "TRUE"]
 
 
 def load_disabled(path=DISABLED_PATH):
@@ -94,7 +94,7 @@ def save_disabled(keys, path=DISABLED_PATH):
 
 
 def camera_key(row):
-    return f"{row['nvr'].strip()}/{row['channel'].strip()}"
+    return f"{(row.get('nvr') or '').strip()}/{(row.get('channel') or '').strip()}"
 
 
 def track_id_from_channel(channel):
@@ -117,7 +117,8 @@ def nvr_time(dt):
 
 
 def parse_nvr_time(s):
-    return datetime.strptime(s.strip().rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+    clean = s.strip().rstrip("Z").split(".")[0]
+    return datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
 
 
 def resolve_window(start, end, last_minutes, tz_offset_hours):
@@ -174,12 +175,10 @@ def resolve_daily_windows(start_date_str, end_date_str, start_time_str, end_time
         raise ValueError("date range cannot exceed 90 days")
     t_start = parse_time_str(start_time_str)
     t_end = parse_time_str(end_time_str)
-    if t_start == t_end:
-        raise ValueError("daily start time and end time cannot be the same")
 
     windows = []
     curr = d_start
-    overnight = t_start > t_end
+    overnight = t_start >= t_end
     while curr <= d_end:
         w_start = datetime.combine(curr, t_start)
         w_end = datetime.combine(curr + timedelta(days=1 if overnight else 0), t_end)
@@ -395,7 +394,10 @@ class NvrClient:
             os.replace(tmp, dest)
         finally:
             if os.path.exists(tmp):
-                os.remove(tmp)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------- per-camera work
@@ -432,7 +434,7 @@ def plan_camera(row, client, start, end, mode):
         return plan
     try:
         plan.segments = client.search(plan.track_id, start, end)
-    except (IsapiError, ET.ParseError) as e:
+    except (IsapiError, ET.ParseError, ValueError) as e:
         plan.error = f"search: {e}"
         return plan
     if not plan.segments:
@@ -645,6 +647,8 @@ def scan_and_repair_legacies(root_dir, proc_registry=None, cancel_event=None, on
                 on_file(i, len(mp4_files), path, "converting")
             try:
                 ok, err = repair_legacy_file(path, proc_registry, cancel_event)
+            except Cancelled:
+                raise
             except Exception as exc:
                 ok, err = False, str(exc)
             if ok:
@@ -666,6 +670,8 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
     """Stream-copy the covered pieces into one mp4.  Audio is included when present
     (re-encoded to AAC if the source codec isn't MP4-native).
     Written to a temp name first so a failure never leaves a file that looks complete."""
+    if not parts:
+        return False, "no recording parts covered the window"
     tmp_out = out_path + ".part.mp4"
     timeout = 600 + int(sum(p[2] for p in parts) / 10)
     try:
@@ -686,11 +692,14 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
             pieces = []
             codec = ""
             audio = ""
-            for i, (src, offset, dur) in enumerate(parts):
+            for src, _, _ in parts:
                 if not codec:
                     codec = probe_video_codec(src)
                 if not audio:
                     audio = probe_audio_codec(src)
+                if codec and audio:
+                    break
+            for i, (src, offset, dur) in enumerate(parts):
                 piece = os.path.join(work_dir, f"piece{i}.ts")
                 # MPEG-TS intermediate: include audio if present (re-encode to AAC if not MP4/TS-native).
                 piece_cmd = ["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
@@ -712,7 +721,12 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
                         os.remove(src)
                     except OSError:
                         pass
-            cmd = ["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0", "-c:v", "copy"]
+            concat_list_path = os.path.join(work_dir, "concat_list.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as f:
+                for piece in pieces:
+                    safe_path = os.path.abspath(piece).replace("\\", "/").replace("'", "'\\''")
+                    f.write(f"file '{safe_path}'\n")
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-map", "0:v:0", "-c:v", "copy"]
             if audio:
                 cmd.extend(["-map", "0:a?", "-c:a", "copy"])
             if codec in ("hevc", "h265"):
@@ -847,8 +861,24 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                     lengths[seg.name] = seg.size
 
             if args.trim and file_done(dest_final):
-                seg_paths[seg.name] = dest_final
-                continue
+                if is_real_mp4(dest_final):
+                    seg_paths[seg.name] = dest_final
+                    continue
+                if seg.name in legacy:
+                    report("remuxing")
+                    ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
+                    if ok:
+                        result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                        seg_paths[seg.name] = dest_final
+                        continue
+                    result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
+                else:
+                    result["notes"].append(f"corrupted segment found ({os.path.basename(dest_final)}), re-downloading")
+                try:
+                    os.remove(dest_final)
+                except OSError:
+                    pass
+                lengths[seg.name] = seg.size
 
             def on_length(n, name=seg.name):
                 lengths[name] = n
@@ -1104,6 +1134,9 @@ def main():
         sys.exit(str(e))
 
     rows = load_online_rows(args.csv)
+    dupes = sorted(k for k, n in collections.Counter(camera_key(r) for r in rows).items() if n > 1)
+    if dupes:
+        sys.exit("Duplicate NVR/channel rows in CSV: " + ", ".join(dupes))
     disabled = load_disabled()
     skipped = [r for r in rows if camera_key(r) in disabled]
     rows = [r for r in rows if camera_key(r) not in disabled]

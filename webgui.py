@@ -268,11 +268,14 @@ def edit_inventory(payload):
     elif action == "set_camera_nvr":
         key, cam_ip = payload.get("key"), (payload.get("camera_ip") or "").strip()
         new = _ip(payload.get("nvr"), "NVR IP")
-        targets = [r for r in rows if _is_online(r) and core.camera_key(r) == key
-                   and (r.get("camera_ip") or "").strip() == cam_ip]
+        targets = [r for r in rows if _is_online(r) and core.camera_key(r) == key]
         if len(targets) != 1:
             raise ValueError("camera not found in CSV (reload the page)")
         r = targets[0]
+        if cam_ip:
+            r["camera_ip"] = cam_ip
+        else:
+            cam_ip = (r.get("camera_ip") or "").strip()
         renamed[key] = f"{new}/{r['channel'].strip()}"
         r["nvr"] = new
         msg = f"Camera {r.get('name')} ({cam_ip}) NVR {key.split('/')[0]} -> {new}"
@@ -850,6 +853,7 @@ function renderProgress(s){
   if (s.running) {
     let eta;
     if (s.cancelling) eta = 'stopping…';
+    else if (s.phase === 'repairing') eta = 'repairing legacy files…';
     else if (s.phase === 'searching') eta = 'searching recordings…';
     else if (snapshotOnly) eta = `${s.done}/${s.total} cameras`;
     else eta = s.eta_s == null ? 'estimating…' : '~' + fmtDur(s.eta_s) + ' left';
@@ -879,10 +883,14 @@ function renderProgress(s){
 
 async function poll(){
   const s = await j('/api/state');
-  if (!busy) document.getElementById('runBtn').disabled = s.running;
+  if (!busy) {
+    document.getElementById('runBtn').disabled = s.running;
+    const repairBtn = document.getElementById('repairBtn');
+    if (repairBtn) repairBtn.disabled = s.running;
+  }
   document.getElementById('stopBtn').disabled = !s.running || s.cancelling;
   renderProgress(s);
-  const head = s.cancelling ? 'Stopping… ' : s.running ? 'Running: ' : (s.finished_at ? 'Finished: ' : 'Idle. ');
+  const head = s.cancelling ? 'Stopping… ' : s.running ? (s.phase === 'repairing' ? 'Repairing: ' : 'Running: ') : (s.finished_at ? 'Finished: ' : 'Idle. ');
   document.getElementById('summary').textContent =
     head + `${s.done}/${s.total} done, ${s.ok} ok, ${s.fail} fail/stopped`
     + (s.window ? ' — ' + s.window : '') + (s.log_file ? ' — log: output/' + s.log_file : '')
@@ -969,14 +977,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def _repair_legacies(self, payload):
+        target_dir = (payload.get("dir") or OUTPUT_DIR).strip()
+        global REGISTRY
         with LOCK:
             if STATE["running"]:
                 self._json({"ok": False, "error": "Cannot repair files while an ingestion run is in progress"}, 409)
                 return
-        target_dir = (payload.get("dir") or OUTPUT_DIR).strip()
-        if not os.path.isdir(target_dir):
-            self._json({"ok": False, "error": f"Directory not found: {target_dir}"}, 400)
-            return
+            if not os.path.isdir(target_dir):
+                self._json({"ok": False, "error": f"Directory not found: {target_dir}"}, 400)
+                return
+            STATE["running"] = True
+            STATE["cancelling"] = False
+            STATE["phase"] = "repairing"
+            CANCEL_EVENT.clear()
+            REGISTRY = core.ProcRegistry()
         try:
             log_line(f"Scanning for legacy non-MP4 files in {target_dir}...")
             def on_repair(idx, total, path, status):
@@ -984,11 +998,19 @@ class Handler(BaseHTTPRequestHandler):
                     log_line(f"[{idx}/{total}] Repaired legacy file: {os.path.basename(path)}")
                 elif status.startswith("failed:"):
                     log_line(f"[{idx}/{total}] Failed to repair {os.path.basename(path)}: {status}")
-            stats = core.scan_and_repair_legacies(target_dir, on_file=on_repair)
+            stats = core.scan_and_repair_legacies(target_dir, proc_registry=REGISTRY, cancel_event=CANCEL_EVENT, on_file=on_repair)
             log_line(f"Legacy scan complete: {stats['repaired']} file(s) converted to MP4, {stats['failed']} failed.")
             self._json({"ok": True, "stats": stats})
+        except core.Cancelled:
+            log_line("Legacy file repair stopped by user")
+            self._json({"ok": False, "error": "cancelled"})
         except Exception as e:
             self._json({"ok": False, "error": str(e)}, 500)
+        finally:
+            with LOCK:
+                STATE["running"] = False
+                STATE["cancelling"] = False
+                STATE["phase"] = None
 
     def _list_cameras(self, csv_path):
         try:

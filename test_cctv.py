@@ -36,6 +36,23 @@ class TestTimeWindows(unittest.TestCase):
         self.assertEqual(windows[0], (datetime(2026, 9, 10, 22, 0, 0), datetime(2026, 9, 11, 4, 0, 0)))
         self.assertEqual(windows[1], (datetime(2026, 9, 11, 22, 0, 0), datetime(2026, 9, 12, 4, 0, 0)))
 
+    def test_parse_nvr_time(self):
+        expected = datetime(2026, 9, 10, 10, 0, 0)
+        # Standard ISO 8601 UTC timestamp
+        self.assertEqual(core.parse_nvr_time("2026-09-10T10:00:00Z"), expected)
+        # Fractional seconds (.000Z and arbitrary microsecond precision)
+        self.assertEqual(core.parse_nvr_time("2026-09-10T10:00:00.000Z"), expected)
+        self.assertEqual(core.parse_nvr_time("2026-09-10T10:00:00.123456Z"), expected)
+        self.assertEqual(core.parse_nvr_time(" 2026-09-10T10:00:00.999Z "), expected)
+
+    def test_daily_windows_24h_full_day(self):
+        windows = core.resolve_daily_windows("2026-09-10", "2026-09-11", "10:00:00", "10:00:00")
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0], (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 11, 10, 0, 0)))
+        self.assertEqual(windows[1], (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 12, 10, 0, 0)))
+        self.assertEqual((windows[0][1] - windows[0][0]).total_seconds(), 86400)
+        self.assertEqual((windows[1][1] - windows[1][0]).total_seconds(), 86400)
+
     def test_covered_seconds_and_trim_parts_overlapping_segments(self):
         row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
         # Segment 1: 10:00 to 10:30 (1800s)
@@ -351,6 +368,12 @@ class TestLegacyDetectionAndRepair(unittest.TestCase):
         ok, msg = core.repair_legacy_file(legacy)
         self.assertTrue(ok, f"repair failed: {msg}")
         self.assertTrue(core.is_real_mp4(legacy))
+
+    def test_cut_clip_empty_parts(self):
+        out = os.path.join(self.test_dir, "clip_empty.mp4")
+        ok, err = core.cut_clip([], out, None, None, self.test_dir)
+        self.assertFalse(ok)
+        self.assertIn("no recording parts", err)
 
     def test_cut_clip_single_part_with_audio(self):
         """Single-part cut_clip should convert G.711 audio to AAC and output genuine MP4."""
@@ -950,6 +973,121 @@ class TestWebGuiFeatures(unittest.TestCase):
         finally:
             core.run_batch = orig_run_batch
             core.write_run_log = orig_write_log
+
+    def test_repair_legacies_when_running_returns_409(self):
+        import webgui
+
+        class DummyHandler:
+            def _json(self, data, code=200):
+                self.resp = (data, code)
+
+        h = DummyHandler()
+        with webgui.LOCK:
+            webgui.STATE["running"] = True
+
+        webgui.Handler._repair_legacies(h, {"dir": self.test_dir})
+        self.assertEqual(h.resp[1], 409)
+        self.assertFalse(h.resp[0]["ok"])
+        self.assertIn("in progress", h.resp[0]["error"])
+
+    def test_repair_legacies_blocks_start_run_and_cleans_up(self):
+        import webgui
+
+        class DummyHandler:
+            def _json(self, data, code=200):
+                self.resp = (data, code)
+
+        h_repair = DummyHandler()
+        h_run = DummyHandler()
+
+        csv_file = os.path.join(self.test_dir, "cams.csv")
+        with open(csv_file, "w", encoding="utf-8") as f:
+            f.write("camera_ip,nvr,channel,name,online\n192.168.1.10,192.168.1.2,D1,Gate,TRUE\n")
+
+        start_run_captured = []
+
+        orig_scan = core.scan_and_repair_legacies
+        def mock_scan(root_dir, proc_registry=None, cancel_event=None, on_file=None):
+            self.assertTrue(webgui.STATE["running"])
+            self.assertEqual(webgui.STATE["phase"], "repairing")
+            self.assertFalse(cancel_event.is_set())
+            webgui.Handler._start_run(h_run, {"csv": csv_file, "last_minutes": 5, "mode": "both"})
+            start_run_captured.append(h_run.resp)
+            return {"total": 0, "legacy": 0, "repaired": 0, "failed": 0, "errors": []}
+
+        try:
+            core.scan_and_repair_legacies = mock_scan
+            webgui.Handler._repair_legacies(h_repair, {"dir": self.test_dir})
+        finally:
+            core.scan_and_repair_legacies = orig_scan
+
+        self.assertTrue(h_repair.resp[0]["ok"])
+        self.assertEqual(len(start_run_captured), 1)
+        resp, code = start_run_captured[0]
+        self.assertEqual(code, 409)
+        self.assertFalse(resp["ok"])
+        self.assertIn("already in progress", resp["error"])
+        self.assertFalse(webgui.STATE["running"])
+        self.assertFalse(webgui.STATE["cancelling"])
+        self.assertIsNone(webgui.STATE["phase"])
+
+    def test_repair_legacies_cancellation_via_stop_run(self):
+        import webgui
+
+        class DummyHandler:
+            def _json(self, data, code=200):
+                self.resp = (data, code)
+
+        h_repair = DummyHandler()
+        h_cancel = DummyHandler()
+
+        orig_scan = core.scan_and_repair_legacies
+        def mock_scan(root_dir, proc_registry=None, cancel_event=None, on_file=None):
+            self.assertTrue(webgui.STATE["running"])
+            self.assertEqual(webgui.STATE["phase"], "repairing")
+            webgui.Handler._cancel(h_cancel)
+            self.assertEqual(h_cancel.resp[1], 200)
+            self.assertTrue(h_cancel.resp[0]["ok"])
+            self.assertTrue(cancel_event.is_set())
+            core.check_cancel(cancel_event)
+
+        try:
+            core.scan_and_repair_legacies = mock_scan
+            webgui.Handler._repair_legacies(h_repair, {"dir": self.test_dir})
+        finally:
+            core.scan_and_repair_legacies = orig_scan
+
+        self.assertFalse(h_repair.resp[0]["ok"])
+        self.assertEqual(h_repair.resp[0]["error"], "cancelled")
+        self.assertTrue(any("Legacy file repair stopped by user" in l for l in webgui.STATE["log"]))
+        self.assertFalse(webgui.STATE["running"])
+        self.assertFalse(webgui.STATE["cancelling"])
+        self.assertIsNone(webgui.STATE["phase"])
+
+    def test_edit_inventory_set_camera_nvr_resilient(self):
+        import webgui
+
+        csv_file = os.path.join(self.test_dir, "inventory.csv")
+        with open(csv_file, "w", encoding="utf-8") as f:
+            f.write("camera_ip,nvr,channel,name,online\n")
+            f.write("192.168.1.50 ,192.168.1.10,D1,Cam01,TRUE\n")
+
+        payload = {
+            "action": "set_camera_nvr",
+            "csv": csv_file,
+            "key": "192.168.1.10/D1",
+            "camera_ip": "192.168.1.99",
+            "nvr": "192.168.1.20",
+        }
+        msg = webgui.edit_inventory(payload)
+        self.assertIn("192.168.1.20", msg)
+
+        fields, rows = webgui.read_inventory(csv_file)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["nvr"], "192.168.1.20")
+        self.assertEqual(r["camera_ip"], "192.168.1.99")
+        self.assertEqual(core.camera_key(r), "192.168.1.20/D1")
 
 
 if __name__ == "__main__":
