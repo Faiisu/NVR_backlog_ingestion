@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -58,7 +59,7 @@ STALE_SEGMENTS_S = 6 * 3600
 def load_config_env(path):
     cfg = {}
     if os.path.exists(path):
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -76,18 +77,18 @@ def load_online_rows(csv_path):
 def load_disabled(path=DISABLED_PATH):
     """Camera keys ('<nvr>/<channel>') switched off by the user; kept apart from the inventory CSV."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             keys = json.load(f)
     except FileNotFoundError:
         return set()
-    except ValueError:
-        raise ValueError(f"{os.path.basename(path)} is not valid JSON; fix or delete it")
+    except ValueError as e:
+        raise ValueError(f"{os.path.basename(path)} is not valid JSON; fix or delete it") from e
     return {k for k in keys if isinstance(k, str)}
 
 
 def save_disabled(keys, path=DISABLED_PATH):
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(sorted(keys), f, indent=1)
     os.replace(tmp, path)
 
@@ -131,8 +132,8 @@ def resolve_window(start, end, last_minutes, tz_offset_hours):
         try:
             start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
             end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            raise ValueError("start/end must be in format YYYY-MM-DD HH:MM:SS")
+        except ValueError as e:
+            raise ValueError("start/end must be in format YYYY-MM-DD HH:MM:SS") from e
     else:
         if not 0 < last_minutes <= 7 * 24 * 60:
             raise ValueError("last minutes must be greater than 0 and at most 7 days")
@@ -322,10 +323,10 @@ class NvrClient:
             return opener.open(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                raise IsapiError(f"NVR {self.host} rejected the username/password (HTTP 401)")
-            raise IsapiError(f"NVR {self.host} {path} returned HTTP {e.code}")
+                raise IsapiError(f"NVR {self.host} rejected the username/password (HTTP 401)") from e
+            raise IsapiError(f"NVR {self.host} {path} returned HTTP {e.code}") from e
         except (urllib.error.URLError, OSError) as e:
-            raise IsapiError(f"cannot reach NVR {self.host}: {getattr(e, 'reason', e)}")
+            raise IsapiError(f"cannot reach NVR {self.host}: {getattr(e, 'reason', e)}") from e
 
     def search(self, track_id, start, end):
         """Recording segments on `track_id` overlapping [start, end), oldest first."""
@@ -385,7 +386,7 @@ class NvrClient:
                     try:
                         chunk = resp.read(DOWNLOAD_CHUNK)
                     except (OSError, TimeoutError) as e:
-                        raise IsapiError(f"download from {self.host} interrupted: {e}")
+                        raise IsapiError(f"download from {self.host} interrupted: {e}") from e
                     if not chunk:
                         break
                     f.write(chunk)
@@ -490,16 +491,18 @@ def mark_existing(plan, args, start, end):
                     plan.clip_exists = True
                 else:
                     plan.legacy_clip = True
-    else:
-        plan.existing = set()
-        plan.legacy = set()
-        for s in plan.segments:
-            p = raw_segment_path(plan.row, s, args.output_dir)
-            if file_done(p):
-                if is_real_mp4(p):
-                    plan.existing.add(s.name)
-                else:
-                    plan.legacy.add(s.name)
+        if plan.clip_exists or plan.legacy_clip:
+            return
+
+    plan.existing = set()
+    plan.legacy = set()
+    for s in plan.segments:
+        p = raw_segment_path(plan.row, s, args.output_dir)
+        if file_done(p):
+            if is_real_mp4(p):
+                plan.existing.add(s.name)
+            else:
+                plan.legacy.add(s.name)
 
 
 def trim_parts(plan, start, end, seg_paths):
@@ -523,13 +526,46 @@ def probe_video_codec(path):
         return ""
 
 
+def probe_audio_codec(path):
+    """Return audio codec name (e.g. 'aac', 'pcm_mulaw') or empty string if no audio / undetectable."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                              "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", path],
+                             capture_output=True, text=True, timeout=15)
+        return out.stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# Audio codecs that can be stream-copied into an MP4 container without re-encoding.
+_MP4_NATIVE_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac", "opus", "flac"}
+
+
+def _audio_args(audio_codec):
+    """Return ffmpeg arguments to include audio.  Stream-copy if the codec is
+    MP4-native, otherwise re-encode to AAC (handles G.711 µ-law/A-law and other
+    non-MP4 codecs from Hikvision NVR).  Returns empty list when there is no audio."""
+    if not audio_codec:
+        return []
+    args = ["-map", "0:a?"]
+    if audio_codec in _MP4_NATIVE_AUDIO:
+        args.extend(["-c:a", "copy"])
+    else:
+        args.extend(["-c:a", "aac", "-b:a", "128k"])
+    return args
+
+
 def remux_to_mp4(src_path, out_path, proc_registry, cancel_event):
     """Stream-copy one raw recording segment (.ps) into a standard MP4 container.
+    Audio is included when present: MP4-native codecs (AAC, MP3, …) are stream-copied,
+    others (G.711 µ-law/A-law from Hikvision NVR) are re-encoded to AAC.
     Written to a temp name first so a failure never leaves a file that looks complete."""
     tmp_out = out_path + ".part.mp4"
     timeout = 600
     codec = probe_video_codec(src_path)
-    cmd = ["ffmpeg", "-y", "-i", src_path, "-map", "0:v:0", "-c", "copy"]
+    audio = probe_audio_codec(src_path)
+    cmd = ["ffmpeg", "-y", "-i", src_path, "-map", "0:v:0", "-c:v", "copy"]
+    cmd.extend(_audio_args(audio))
     if codec in ("hevc", "h265"):
         cmd.extend(["-tag:v", "hvc1"])
     cmd.extend(["-movflags", "+faststart", tmp_out])
@@ -572,7 +608,8 @@ def scan_and_repair_legacies(root_dir, proc_registry=None, cancel_event=None, on
         return stats
 
     mp4_files = []
-    for dirpath, _, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if d != SEGMENTS_DIRNAME and not d.startswith(".")]
         for fname in filenames:
             if fname.lower().endswith(".mp4") and not fname.lower().endswith(".part.mp4"):
                 mp4_files.append(os.path.join(dirpath, fname))
@@ -606,16 +643,19 @@ def scan_and_repair_legacies(root_dir, proc_registry=None, cancel_event=None, on
 
 
 def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
-    """Stream-copy the covered pieces into one mp4. Written to a temp name first so a failure never
-    leaves a file that looks complete."""
+    """Stream-copy the covered pieces into one mp4.  Audio is included when present
+    (re-encoded to AAC if the source codec isn't MP4-native).
+    Written to a temp name first so a failure never leaves a file that looks complete."""
     tmp_out = out_path + ".part.mp4"
     timeout = 600 + int(sum(p[2] for p in parts) / 10)
     try:
         if len(parts) == 1:
             src, offset, dur = parts[0]
             codec = probe_video_codec(src)
+            audio = probe_audio_codec(src)
             cmd = ["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
-                   "-map", "0:v:0", "-c", "copy"]
+                   "-map", "0:v:0", "-c:v", "copy"]
+            cmd.extend(_audio_args(audio))
             if codec in ("hevc", "h265"):
                 cmd.extend(["-tag:v", "hvc1"])
             cmd.extend(["-movflags", "+faststart", tmp_out])
@@ -625,17 +665,30 @@ def cut_clip(parts, out_path, proc_registry, cancel_event, work_dir):
         else:
             pieces = []
             codec = ""
+            audio = ""
             for i, (src, offset, dur) in enumerate(parts):
                 if not codec:
                     codec = probe_video_codec(src)
+                if not audio:
+                    audio = probe_audio_codec(src)
                 piece = os.path.join(work_dir, f"piece{i}.ts")
-                ok, err = run_ffmpeg(["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
-                                      "-map", "0:v:0", "-c", "copy", "-f", "mpegts", piece],
-                                     timeout, proc_registry, cancel_event)
+                # MPEG-TS intermediate: include audio if present (re-encode to AAC if not MP4/TS-native).
+                piece_cmd = ["ffmpeg", "-y", "-ss", f"{offset:.3f}", "-i", src, "-t", f"{dur:.3f}",
+                             "-map", "0:v:0", "-c:v", "copy"]
+                if audio:
+                    piece_cmd.extend(["-map", "0:a?"])
+                    if audio in {"aac", "mp3", "ac3"}:
+                        piece_cmd.extend(["-c:a", "copy"])
+                    else:
+                        piece_cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+                piece_cmd.extend(["-f", "mpegts", piece])
+                ok, err = run_ffmpeg(piece_cmd, timeout, proc_registry, cancel_event)
                 if not ok:
                     return False, err
                 pieces.append(piece)
-            cmd = ["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0", "-c", "copy"]
+            cmd = ["ffmpeg", "-y", "-i", "concat:" + "|".join(pieces), "-map", "0:v:0", "-c:v", "copy"]
+            if audio:
+                cmd.extend(["-map", "0:a?", "-c:a", "copy"])
             if codec in ("hevc", "h265"):
                 cmd.extend(["-tag:v", "hvc1"])
             cmd.extend(["-movflags", "+faststart", tmp_out])
@@ -663,7 +716,9 @@ def snapshot_via_rtsp(host, track_id, start, user, password, out_path, timeout_s
     """Snapshot-only mode: one frame over RTSP playback instead of downloading a whole segment."""
     stamp = start.strftime("%Y%m%dT%H%M%SZ")
     stop = (start + timedelta(seconds=10)).strftime("%Y%m%dT%H%M%SZ")
-    url = f"rtsp://{user}:{password}@{host}:{RTSP_PORT}/Streaming/tracks/{track_id}?starttime={stamp}&endtime={stop}"
+    q_user = urllib.parse.quote(str(user), safe="")
+    q_password = urllib.parse.quote(str(password), safe="")
+    url = f"rtsp://{q_user}:{q_password}@{host}:{RTSP_PORT}/Streaming/tracks/{track_id}?starttime={stamp}&endtime={stop}"
     return run_ffmpeg(["ffmpeg", "-y", "-rtsp_transport", "tcp", "-timeout", str(timeout_s * 1_000_000),
                        "-i", url, "-frames:v", "1", "-q:v", "2", out_path],
                       timeout_s + 30, proc_registry, cancel_event)
@@ -723,7 +778,7 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
         elif plan.legacy_clip:
             result["notes"].append("clip detected as legacy non-MP4 (converting in-place)")
             report("remuxing")
-            ok, err = remux_to_mp4(base + ".mp4", base + ".mp4", proc_registry, cancel_event)
+            ok, err = repair_legacy_file(base + ".mp4", proc_registry, cancel_event)
             if ok:
                 result["notes"].append(f"converted legacy clip to MP4: {os.path.basename(base + '.mp4')}")
                 plan.clip_exists = True
@@ -743,13 +798,13 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
 
             if seg.name in existing:
                 seg_paths[seg.name] = dest_final
-                if dest_final not in result["files"]:
+                if not args.trim and dest_final not in result["files"]:
                     result["files"].append(dest_final)
                 continue
 
             if not args.trim and seg.name in legacy:
                 report("remuxing")
-                ok, err = remux_to_mp4(dest_final, dest_final, proc_registry, cancel_event)
+                ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
                 if ok:
                     if dest_final not in result["files"]:
                         result["files"].append(dest_final)
@@ -865,7 +920,10 @@ def prepare_segments_dir(output_dir):
         path = os.path.join(root, name)
         try:
             if now - os.path.getmtime(path) > STALE_SEGMENTS_S:
-                shutil.rmtree(path, ignore_errors=True)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
         except OSError:
             pass
     run_dir = os.path.join(root, f"run_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}")
@@ -951,7 +1009,7 @@ def run_windows(rows, args, windows, callbacks=None, cancel_event=None, proc_reg
 
 def write_run_log(results, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["name", "nvr", "channel", "status", "files", "errors", "notes"])
         for r in results:
@@ -985,7 +1043,7 @@ def main():
                          "(default: save the NVR's recording files as-is)")
     ap.add_argument("--user", default=None, help="NVR username (default from config.env / env NVR_USER)")
     ap.add_argument("--password", default=None, help="NVR password (default from config.env / env NVR_PASSWORD)")
-    ap.add_argument("--repair-legacies", nargs="?", const="output", default=None,
+    ap.add_argument("--repair-legacies", nargs="?", const="", default=None,
                     help="Scan output directory (or specified folder) and convert all legacy non-MP4 files in-place to genuine MP4")
     args = ap.parse_args()
 

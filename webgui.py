@@ -32,7 +32,7 @@ FINAL_STAGES = ("ok", "fail", "cancelled")
 SPEED_WINDOW_S = 5
 ETA_WINDOW_S = 20
 
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 CANCEL_EVENT = threading.Event()
 REGISTRY = core.ProcRegistry()
 
@@ -42,6 +42,7 @@ def fresh_state():
         "running": False, "cancelling": False, "phase": None,
         "started_at": None, "finished_at": None, "window": None, "mode": None,
         "total": 0, "done": 0, "ok": 0, "fail": 0,
+        "current_window": 1, "total_windows": 1,
         "cameras": {},   # key -> {name, nvr, channel, stage, ok, error, note, files, bytes, expected}
         "log": [], "log_file": None, "error": None,
         # Transfer stats, refreshed once a second by stats_loop().
@@ -59,7 +60,7 @@ def load_ui_defaults():
     d = dict(UI_DEFAULTS)
     if os.path.exists(UI_STATE_PATH):
         try:
-            with open(UI_STATE_PATH) as f:
+            with open(UI_STATE_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             d.update({k: v for k, v in saved.items() if k in UI_DEFAULTS})
         except (OSError, ValueError):
@@ -71,13 +72,24 @@ def load_ui_defaults():
 
 
 def save_ui_defaults(d):
-    with open(UI_STATE_PATH, "w") as f:
-        json.dump(d, f)
+    tmp = UI_STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, UI_STATE_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def log_line(msg):
-    STATE["log"].append(f"[{datetime.now():%H:%M:%S}] {msg}")
-    STATE["log"] = STATE["log"][-300:]
+    with LOCK:
+        STATE["log"].append(f"[{datetime.now():%H:%M:%S}] {msg}")
+        STATE["log"] = STATE["log"][-300:]
 
 
 def short_error(err):
@@ -95,7 +107,7 @@ def rel(path):
 
 
 class GuiCallbacks(core.Callbacks):
-    def stage(self, key, stage, row, errors=(), notes=(), files=(), expected_bytes=None):
+    def stage(self, key, stage, _row=None, errors=(), notes=(), files=(), expected_bytes=None):
         with LOCK:
             cam = STATE["cameras"].get(key)
             if cam is None:
@@ -159,7 +171,18 @@ def update_stats():
         eta_rate = rate_over(ETA_WINDOW_S)
         waiting = STATE["phase"] == "searching" or STATE["cancelling"]
         STATE["eta_s"] = None if waiting or eta_rate <= 0 else round(remaining / eta_rate)
-        fraction = RUN["downloaded"] / expected if expected else 0
+        total_windows = STATE.get("total_windows", 1)
+        if total_windows > 1:
+            idx = STATE.get("current_window", 1)
+            cams_count = STATE.get("cams_count") or len(cams) or 1
+            if expected:
+                win_fraction = sum(c["bytes"] for c in cams) / expected
+            else:
+                completed_in_window = STATE["done"] - (idx - 1) * cams_count
+                win_fraction = max(0.0, completed_in_window / cams_count)
+            fraction = ((idx - 1) + min(win_fraction, 1.0)) / total_windows
+        else:
+            fraction = RUN["downloaded"] / expected if expected else 0
     # Never move backwards (e.g. when a segment turns out larger than the search reported).
     STATE["fraction"] = max(STATE["fraction"], min(fraction, 0.99))
 
@@ -180,8 +203,8 @@ def _ip(value, label):
     v = (value or "").strip() if isinstance(value, str) else ""
     try:
         ipaddress.ip_address(v)
-    except ValueError:
-        raise ValueError(f"{label} is not a valid IP address: {v!r}")
+    except ValueError as e:
+        raise ValueError(f"{label} is not a valid IP address: {v!r}") from e
     return v
 
 
@@ -237,7 +260,7 @@ def edit_inventory(payload):
     elif action == "add_camera":
         channel = (payload.get("channel") or "").strip()
         core.track_id_from_channel(channel)  # raises ValueError on a bad code
-        r = {k: "" for k in fields}
+        r = dict.fromkeys(fields, "")
         r.update({"camera_ip": _ip(payload.get("camera_ip"), "Camera IP"), "nvr": _ip(payload.get("nvr"), "NVR IP"),
                   "channel": channel.upper(), "name": (payload.get("name") or "").strip() or channel.upper()})
         if "manage_port" in fields:
@@ -268,8 +291,8 @@ def _param(payload, key, cast, label):
         return UI_DEFAULTS[key]
     try:
         n = cast(v)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"{label} is not a valid number: {v!r}")
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError(f"{label} is not a valid number: {v!r}") from e
     if not math.isfinite(n):
         raise ValueError(f"{label} is not a valid number: {v!r}")
     return n
@@ -313,7 +336,7 @@ def plan_run(payload):
     try:
         rows = core.load_online_rows(csv_path)
     except OSError as e:
-        raise ValueError(f"cannot read CSV: {e}")
+        raise ValueError(f"cannot read CSV: {e}") from e
     if not rows:
         raise ValueError("no online cameras in CSV")
     # Progress and Disable are keyed by NVR/channel, so two rows with the same pair would be merged.
@@ -330,8 +353,8 @@ def plan_run(payload):
     class Args:
         pass
     args = Args()
-    args.user = cfg.get("NVR_USER", "admin")
-    args.password = cfg.get("NVR_PASSWORD", "admin")
+    args.user = os.environ.get("NVR_USER") or cfg.get("NVR_USER") or "admin"
+    args.password = os.environ.get("NVR_PASSWORD") or cfg.get("NVR_PASSWORD") or "admin"
     args.mode = mode
     args.output_dir = OUTPUT_DIR
     args.workers = workers
@@ -362,6 +385,8 @@ def do_run(plan):
                     log_line(f"=== Starting Day {idx}/{total_windows}: {w_start} -> {w_end} ===")
                 else:
                     STATE["window"] = f"{w_start} -> {w_end} (NVR local time)"
+                STATE["current_window"] = idx
+                STATE["total_windows"] = total_windows
                 STATE["phase"] = "searching"
                 RUN["searched"] = 0
                 for row in plan["rows"]:
@@ -371,6 +396,7 @@ def do_run(plan):
                     cam["error"] = None
                     cam["note"] = None
                     cam["expected"] = 0
+                    cam["bytes"] = 0
 
             w_results = core.run_batch(plan["rows"], plan["args"], w_start, w_end,
                                        callbacks=GuiCallbacks(), cancel_event=CANCEL_EVENT, proc_registry=REGISTRY)
@@ -924,9 +950,9 @@ class Handler(BaseHTTPRequestHandler):
             log_line(f"Scanning for legacy non-MP4 files in {target_dir}...")
             def on_repair(idx, total, path, status):
                 if status == "ok":
-                    log_line(f"Repaired legacy file: {os.path.basename(path)}")
+                    log_line(f"[{idx}/{total}] Repaired legacy file: {os.path.basename(path)}")
                 elif status.startswith("failed:"):
-                    log_line(f"Failed to repair {os.path.basename(path)}: {status}")
+                    log_line(f"[{idx}/{total}] Failed to repair {os.path.basename(path)}: {status}")
             stats = core.scan_and_repair_legacies(target_dir, on_file=on_repair)
             log_line(f"Legacy scan complete: {stats['repaired']} file(s) converted to MP4, {stats['failed']} failed.")
             self._json({"ok": True, "stats": stats})
@@ -987,18 +1013,25 @@ class Handler(BaseHTTPRequestHandler):
         if any(c in user + password for c in "\r\n"):
             self._json({"ok": False, "error": "credentials cannot contain line breaks"}, 400)
             return
+        tmp = core.CONFIG_ENV_PATH + ".tmp"
         try:
             cfg = core.load_config_env(core.CONFIG_ENV_PATH)
             if user:
                 cfg["NVR_USER"] = user
             if password:
                 cfg["NVR_PASSWORD"] = password
-            with open(core.CONFIG_ENV_PATH, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 for k, v in cfg.items():
                     f.write(f"{k}={v}\n")
-            os.chmod(core.CONFIG_ENV_PATH, 0o600)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, core.CONFIG_ENV_PATH)
             self._json({"ok": True})
         except OSError as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
             self._json({"ok": False, "error": str(e)}, 500)
 
     def _start_run(self, payload):
@@ -1029,6 +1062,8 @@ class Handler(BaseHTTPRequestHandler):
                 "window": win_str,
                 "total": cams_count * total_windows,
                 "cams_count": cams_count,
+                "current_window": 1,
+                "total_windows": total_windows,
             })
             RUN.clear()
             RUN.update({"t0": time.monotonic(), "downloaded": 0, "searched": 0, "samples": collections.deque()})

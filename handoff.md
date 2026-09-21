@@ -88,10 +88,7 @@
   * ปรับปรุง `do_run()` และ `GuiCallbacks` รองรับ Multi-window Ingestion และรายงานผลสะสม
 
 ### 3) [`test_cctv.py`](file:///Volumes/Mac_storage/projects.nosync/NVR_server_ingestion/test_cctv.py)
-* ไฟล์ชุดทดสอบ Unit Tests อัตโนมัติ ครอบคลุม 9 Test Cases ทดสอบทั้ง Time Windows, MP4 Check, In-place Repair, Directory Scan และ Process Camera Mocking
-
-### 4) [`README.md`](file:///Volumes/Mac_storage/projects.nosync/NVR_server_ingestion/README.md)
-* อัปเดตคำอธิบายการทำงาน MP4 Remuxing, Daily Recurring, Duplicate Detection & Legacy Repair และคำสั่งการรัน Test Suite
+* ไฟล์ชุดทดสอบ Unit Tests อัตโนมัติ ครอบคลุม 30 Test Cases ครอบคลุม 4 กลุ่มหลัก: Legacy Detection & Audio Handling, Time Windows, CLI & File Handling และ WebGUI Features
 
 ---
 
@@ -99,21 +96,28 @@
 
 1. **Python Syntax Compilation:**
    ```bash
-   python3 -m py_compile cctv_retrieve.py webgui.py
-   # ผลลัพธ์: Exit Code 0 (ไวยากรณ์ถูกต้องสมบูรณ์)
+   python3 -m py_compile cctv_retrieve.py webgui.py test_cctv.py
+   # ผลลัพธ์: Exit Code 0 (ไวยากรณ์ถูกต้องสมบูรณ์ทุกไฟล์)
    ```
 
-2. **Automated Unit Tests (ครอบคลุม 9 กรณีทดสอบ):**
-   * ดูรายละเอียดชุดทดสอบทั้งหมดใน [ส่วนที่ 7](#7-ผลการทดสอบความถูกต้อง-comprehensive-automated-tests)
-   * **ผลการทดสอบ:** `Ran 9 tests in 0.5s ... OK`
+2. **Ruff Linter Check:**
+   ```bash
+   ruff check . --select F,E9,B,W6
+   # ผลลัพธ์: All checks passed! (ไม่มีข้อผิดพลาดด้าน Syntax, Runtime หรือ Bug-prone patterns)
+   ```
 
-3. **CLI Execution Test:**
-   * ทดสอบคำสั่ง:
+3. **Automated Unit Tests (ครอบคลุม 30 กรณีทดสอบ):**
+   * ดูรายละเอียดชุดทดสอบทั้งหมดใน [ส่วนที่ 7](#7-ผลการทดสอบความถูกต้อง-comprehensive-automated-tests)
+   * **คำสั่ง:** `python3 -m unittest test_cctv.py`
+   * **ผลการทดสอบ:** `Ran 30 tests in 2.109s ... OK` (ผ่านครบ 100%)
+
+4. **CLI Execution & Parameter Verification:**
+   * ทดสอบคำสั่ง Help และ Parameter Parsing:
      ```bash
-     python3 cctv_retrieve.py --start-date 2026-09-10 --end-date 2026-09-12 \
-       --daily-start 10:00:00 --daily-end 22:00:00 --timeout 1
+     python3 cctv_retrieve.py --help
+     python3 cctv_retrieve.py --repair-legacies
      ```
-   * **ผลลัพธ์:** ระบบแสดง `Daily Recurring Windows: 3 day(s)` และรันผ่านลูป `Day 1/3`, `Day 2/3`, `Day 3/3` พร้อมบันทึก Log ลง CSV ครบถ้วน
+   * **ผลลัพธ์:** Argument parsing ของ `--repair-legacies` ทำงานถูกต้องทั้งแบบระบุไดเรกทอรีและแบบ Default Fallback ไปยัง `--output-dir`
 
 ---
 
@@ -205,35 +209,53 @@ python3 cctv_retrieve.py --csv camera_n_nvr.csv \
 
 ## 7. ผลการทดสอบความถูกต้อง (Comprehensive Automated Tests)
 
-สร้างไฟล์ทดสอบ [`test_cctv.py`](file:///Volumes/Mac_storage/projects.nosync/NVR_server_ingestion/test_cctv.py) รวบรวม Test Cases ทั้งหมด 9 การทดสอบ:
-1. `test_is_real_mp4_checks`: ตรวจสอบไฟล์จำลองทั้ง Non-existent, Empty, Truncated, Fake Legacy MPEG-PS และ Genuine MP4
-2. `test_repair_legacy_file`: ทดสอบการ Remux ไฟล์เก่าเป็น MP4 แท้ และตรวจสอบการป้องกันการแปลงซ้ำ
-3. `test_scan_and_repair_legacies`: ทดสอบการสแกนและแปลงไฟล์แบบ Recursive ในโครงสร้างโฟลเดอร์
-4. `test_mark_existing_distinguishes_legacy`: ทดสอบการแยกแยะไฟล์ Real MP4 และ Legacy ในโหมดดาวน์โหลด Whole Segment
-5. `test_process_camera_converts_legacy_without_download`: ทดสอบกระบวนการ Ingestion ยืนยันว่า `client.download` ไม่ถูกเรียกเลยแม้แต่ครั้งเดียวเมื่อมีไฟล์เก่าบนดิสก์
+สร้างและปรับปรุงไฟล์ทดสอบ [`test_cctv.py`](file:///Volumes/Mac_storage/projects.nosync/NVR_server_ingestion/test_cctv.py) รวบรวม Test Cases ทั้งหมด 30 การทดสอบ แบ่งออกเป็น 4 กลุ่มหลัก:
+
+### 1) TestLegacyDetectionAndRepair (16 การทดสอบ)
+1. `test_is_real_mp4_checks`: ตรวจสอบ Header ISO BMFF ของไฟล์จำลอง (Non-existent, Empty, Truncated, Fake Legacy MPEG-PS, Genuine MP4)
+2. `test_repair_legacy_file`: ทดสอบการ Remux ไฟล์เก่าเป็น MP4 แท้ และการป้องกันการแปลงซ้ำ
+3. `test_scan_and_repair_legacies`: ทดสอบการสแกนและแปลงไฟล์แบบ Recursive
+4. `test_mark_existing_distinguishes_legacy`: ทดสอบการแยกแยะไฟล์ Real MP4 และ Legacy ในโหมด Whole Segment
+5. `test_process_camera_converts_legacy_without_download`: ทดสอบว่าไม่ดาวน์โหลดซ้ำเมื่อมีไฟล์เก่าบนดิสก์
 6. `test_process_camera_trimmed_legacy_clip`: ทดสอบการ Remux คลิปที่เคย Trim ไว้แบบเก่าให้กลายเป็น Real MP4
-7. `test_single_window_explicit`: การคำนวณหน้าต่างเวลาแบบเดิม
-8. `test_daily_windows_same_day`: การแตกวัน 10, 11, 12 เวลา 10:00-22:00
-9. `test_daily_windows_overnight`: การแตกวันสำหรับเคสข้ามคืน 22:00-04:00
+7. `test_audio_args_helper`: ตรวจสอบการสร้างอาร์กิวเมนต์ ffmpeg สำหรับ Audio Codec ต่างๆ (AAC, MP3, PCM µ-law/A-law)
+8. `test_repair_legacy_file_with_audio`: ทดสอบการ Remux ไฟล์ที่มีทั้งสตรีมภาพและเสียง
+9. `test_repair_preserves_aac_audio`: ตรวจสอบการ Stream Copy เสียง AAC โดยไม่มีการแปลงรหัสซ้ำ
+10. `test_repair_video_only_still_works`: ยืนยันว่าไฟล์ที่มีเฉพาะภาพยังคง Remux ได้อย่างถูกต้อง
+11. `test_cut_clip_single_part_with_audio`: ทดสอบการตัดคลิปไฟล์เดี่ยวที่มีเสียง
+12. `test_cut_clip_multipart_with_audio`: ทดสอบการตัดและต่อหลายคลิปผ่าน intermediate MPEG-TS พร้อมเสียง
+13. `test_cut_clip_video_only`: ทดสอบการตัดและต่อคลิปแบบภาพอย่างเดียว
+14. `test_mark_existing_trim_mode_segment_accounting`: ทดสอบการคำนวณ existing และ legacy segments ในโหมด Trim
+15. `test_process_camera_uses_repair_legacy_file_for_clip_and_segment`: ยืนยันการเรียกใช้ `repair_legacy_file` สม่ำเสมอทุกจุด
+16. `test_snapshot_via_rtsp_credential_quoting`: ตรวจสอบ URL Encoding ของ Username/Password ที่มีอักขระพิเศษสำหรับ RTSP
+
+### 2) TestTimeWindows (3 การทดสอบ)
+17. `test_single_window_explicit`: การคำนวณหน้าต่างเวลาแบบเดิม
+18. `test_daily_windows_same_day`: การแตกวันสำหรับเคสในวันเดียวกัน (10:00-22:00)
+19. `test_daily_windows_overnight`: การแตกวันสำหรับเคสข้ามคืน (22:00-04:00)
+
+### 3) TestCliAndFileHandling (4 การทดสอบ)
+20. `test_repair_legacies_cli_arg_resolution`: การ Parse อาร์กิวเมนต์ `--repair-legacies` ทั้งแบบระบุโฟลเดอร์และแบบ Default Fallback
+21. `test_scan_and_repair_skips_segments_and_hidden_dirs`: ตรวจสอบการข้ามโฟลเดอร์ชั่วคราว `.segments` และ hidden directories
+22. `test_prepare_segments_dir_cleans_stale_files_and_dirs`: ตรวจสอบการทำความสะอาดไฟล์และโฟลเดอร์ที่ค้างเกินกำหนด
+23. `test_utf8_file_handling`: ตรวจสอบการอ่าน/เขียนไฟล์ด้วย UTF-8 Encoding
+
+### 4) TestWebGuiFeatures (7 การทดสอบ)
+24. `test_ui_defaults_utf8_and_atomic`: ตรวจสอบการบันทึก UI Defaults แบบ Atomic พร้อม UTF-8
+25. `test_atomic_config_saving`: ตรวจสอบการบันทึก `config.env` แบบ Atomic พร้อมสิทธิ์ 0o600 และ Error Recovery
+26. `test_rlock_and_log_line`: ตรวจสอบความปลอดภัยของ Thread Locking ในฟังก์ชัน `log_line`
+27. `test_repair_legacies_logging`: ตรวจสอบการส่ง Log ข้อความการทำงานของฟังก์ชัน Repair เข้า WebGUI
+28. `test_multi_window_fraction_and_eta`: ตรวจสอบการคำนวณ Progress Fraction และ ETA สะสมในโหมด Daily Recurring หลายวัน
+29. `test_plan_run_env_variables`: ตรวจสอบลำดับความสำคัญของตัวแปรสภาพแวดล้อม (Environment Variables) ใน `plan_run`
+30. `test_edit_inventory_add_camera`: ตรวจสอบการเพิ่มกล้องใหม่และการ Validate IP/Channel ในคลังข้อมูล
 
 **คำสั่งรันชุดทดสอบ:**
 ```bash
-python3 test_cctv.py -v
+python3 -m unittest test_cctv.py -v
 ```
 **ผลลัพธ์:**
 ```text
-test_is_real_mp4_checks ... ok
-test_mark_existing_distinguishes_legacy ... ok
-test_process_camera_converts_legacy_without_download ... ok
-test_process_camera_trimmed_legacy_clip ... ok
-test_repair_legacy_file ... ok
-test_scan_and_repair_legacies ... ok
-test_daily_windows_overnight ... ok
-test_daily_windows_same_day ... ok
-test_single_window_explicit ... ok
-
-----------------------------------------------------------------------
-Ran 9 tests in 0.528s
+Ran 30 tests in 2.109s
 
 OK
 ```
@@ -263,3 +285,60 @@ OK
 * **ไฟล์:** `cctv_retrieve.py` → `scan_and_repair_legacies()`
 * **ปัญหา:** ตรวจ `.mp4` แบบ case-insensitive แต่ตรวจ `.part.mp4` แบบ case-sensitive
 * **แก้ไข:** เปลี่ยนเป็น `fname.lower().endswith(".part.mp4")`
+
+---
+
+## 9. การแก้ไขข้อผิดพลาดและการปรับปรุงเสถียรภาพขั้นสูง (Part 4: Bug Fixes & Hardening)
+
+สรุปรายละเอียดการแก้ไขข้อผิดพลาดและการปรับปรุงเชิงลึกใน Part 4:
+
+### 9.1 การรองรับ Audio Streams และ Transcoding อัตโนมัติ
+* **ไฟล์:** `cctv_retrieve.py` (`probe_audio_codec`, `_audio_args`, `remux_to_mp4`, `cut_clip`)
+* **ปัญหาเดิม:** การ Remux และ Trim เดิมใช้ `-map 0:v:0` ทำให้สัญญาณเสียงจาก NVR ถูกตัดทิ้งทั้งหมด หรือหากคัดลอกเสียงตรงๆ จะเกิดปัญหาเมื่อ NVR ใช้ G.711 µ-law/A-law ซึ่งไม่รองรับในมาตรฐานกล่อง MP4 ส่งผลให้ QuickTime หรือ Windows Media Player ปฏิเสธไฟล์
+* **การแก้ไข:** 
+  * เพิ่มฟังก์ชัน `probe_audio_codec()` เพื่อตรวจสอบสตรีมเสียงในไฟล์ต้นทาง
+  * เพิ่มฟังก์ชัน `_audio_args()`: หากพบเสียงที่เป็น MP4-native (`aac`, `mp3`, `ac3`) จะทำการ Stream Copy (`-c:a copy`), หากพบเสียงรูปแบบอื่น (เช่น `pcm_mulaw`, `pcm_alaw`) จะทำการแปลงรหัสเป็น AAC อัตโนมัติ (`-c:a aac -b:a 128k`)
+  * ปรับปรุงขั้นตอน Concat ใน `cut_clip` ให้รองรับการแปลงเสียงในไฟล์ Intermediate MPEG-TS อย่างสมบูรณ์
+
+### 9.2 การป้องกัน Directory Traversal สแกนโดนโฟลเดอร์ชั่วคราว
+* **ไฟล์:** `cctv_retrieve.py` (`scan_and_repair_legacies`)
+* **ปัญหาเดิม:** `os.walk` สแกนทุกไดเรกทอรี รวมถึง `.git`, `.system_generated`, และ `.segments` ซึ่งอาจมีไฟล์ดิบ `.ps` หรือไฟล์ชั่วคราวที่กำลังดาวน์โหลด
+* **การแก้ไข:** ปรับ `dirnames[:] = [d for d in dirnames if d != SEGMENTS_DIRNAME and not d.startswith(".")]` เพื่อข้ามโฟลเดอร์ชั่วคราวและ hidden directories ทั้งหมด
+
+### 9.3 Atomic File Persistence และ Explicit UTF-8 Encoding
+* **ไฟล์:** `webgui.py`, `cctv_retrieve.py` (`save_ui_defaults`, `save_credentials`, `save_disabled`, `write_run_log`)
+* **ปัญหาเดิม:** การเขียนไฟล์โดยตรงอาจทำให้ไฟล์เสียหายหากเกิดไฟดับหรือ Crash ระหว่างเขียน และไม่ได้ระบุ `encoding="utf-8"` ชัดเจน
+* **การแก้ไข:** ใช้การเขียนลงไฟล์ชั่วคราว `.tmp` ก่อนทำ Atomic Swap ด้วย `os.replace()`, กำหนดสิทธิ์ความปลอดภัย `0o600` บน credentials file ก่อน replace, ดักจับ Exception เพื่อลบไฟล์ `.tmp` ตกค้าง และระบุ `encoding="utf-8"` ครบถ้วนทุกจุด
+
+### 9.4 Thread-Safe WebGUI Logging และ Multi-Window Progress Calculation
+* **ไฟล์:** `webgui.py` (`log_line`, `update_stats`, `do_run`, `GuiCallbacks`)
+* **ปัญหาเดิม:** `log_line` ขาด Thread Lock อาจเกิด Race Condition เมื่อมีหลาย Worker บันทึกข้อความพร้อมกัน และในโหมด Daily Recurring แถบความคืบหน้า (Progress Bar) จะรีเซ็ตกลับเป็น 0% ทุกครั้งที่ขึ้นวันใหม่
+* **การแก้ไข:** 
+  * ห่อ `log_line()` ด้วย `with LOCK:`
+  * ปรับสูตรคำนวณ `fraction` ใน `update_stats()` ให้คำนวณความคืบหน้ารวมสะสมตาม `current_window` และ `total_windows` ทำให้เปอร์เซ็นต์เดินหน้าอย่างต่อเนื่องตลอดทั้ง Batch
+  * รีเซ็ตสถิติไบต์ของแต่ละกล้อง `cam["bytes"] = 0` ในรอบวันใหม่เพื่อป้องกันตัวเลขสะสมคลาดเคลื่อน
+
+### 9.5 RTSP Credential Escaping สำหรับ Snapshot
+* **ไฟล์:** `cctv_retrieve.py` (`snapshot_via_rtsp`)
+* **ปัญหาเดิม:** การใส่ Username หรือ Password ที่มีอักขระพิเศษ (เช่น `@`, `:`, `/`, `#`) เข้า URL RTSP ตรงๆ ทำให้ URL ผิดรูปแบบและเชื่อมต่อไม่สำเร็จ
+* **การแก้ไข:** ใช้ `urllib.parse.quote(str(user), safe="")` และ `urllib.parse.quote(str(password), safe="")` ก่อนนำไปประกอบใน RTSP URL
+
+### 9.6 Stale Segments Cleanup Fix
+* **ไฟล์:** `cctv_retrieve.py` (`prepare_segments_dir`)
+* **ปัญหาเดิม:** การเรียก `shutil.rmtree(path)` โดยไม่ตรวจว่าเป็นไดเรกทอรีหรือไม่ จะเกิด `NotADirectoryError` หากมีไฟล์เดี่ยวตกค้างในโฟลเดอร์ segments
+* **การแก้ไข:** ตรวจสอบ `if os.path.isdir(path): shutil.rmtree(...) else: os.remove(...)`
+
+### 9.7 CLI `--repair-legacies` Parameter Resolution
+* **ไฟล์:** `cctv_retrieve.py` (`main`)
+* **ปัญหาเดิม:** เมื่อผู้ใช้ระบุคำสั่ง `python3 cctv_retrieve.py --repair-legacies` โดยไม่ใส่พาธ แต่ใส่ `--output-dir custom_dir` ตัวแปรจะถูก Hardcode เป็นค่า Default
+* **การแก้ไข:** กำหนด `nargs="?", const="", default=None` และใช้ `target_dir = args.repair_legacies or args.output_dir` ทำให้สามารถรับค่าจาก `--output-dir` ได้อย่างถูกต้อง
+
+### 9.8 การเรียกใช้ `repair_legacy_file` แบบสม่ำเสมอใน `process_camera`
+* **ไฟล์:** `cctv_retrieve.py` (`process_camera`)
+* **ปัญหาเดิม:** การแปลงคลิปและเซกเมนต์เก่าบางจุดเรียก `remux_to_mp4` โดยตรง ข้ามการตรวจสอบ self-healing และ atomic fallback ของ `repair_legacy_file`
+* **การแก้ไข:** เปลี่ยนมาเรียก `repair_legacy_file()` ให้เป็นมาตรฐานเดียวกันทุกจุด
+
+### 9.9 การปฏิบัติตามมาตรฐาน Ruff / Flake8-Bugbear B904
+* **ไฟล์:** `cctv_retrieve.py`, `webgui.py`
+* **ปัญหาเดิม:** การ raise ข้อผิดพลาดใหม่ภายใน `except` clause โดยไม่ใช้ `from err` หรือ `from None` ละเมิดกฎ Flake8-Bugbear (B904)
+* **การแก้ไข:** เพิ่ม `from e` ในจุด Exception Chaining ทั้งหมด ส่งผลให้ผ่านการตรวจสอบ `ruff check . --select F,E9,B,W6` ได้อย่างสมบูรณ์แบบ 100% โดยไม่มีข้อผิดพลาดหลงเหลือ
