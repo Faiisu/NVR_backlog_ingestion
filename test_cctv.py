@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Comprehensive test suite for CCTV footage ingestion system."""
 
+import collections
+import io
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
-import io
-import socket
 import threading
+import time as systime
 import unittest
 import urllib.error
 import urllib.request
@@ -996,9 +998,22 @@ class TestWebGuiFeatures(unittest.TestCase):
 
         orig_run_batch = core.run_batch
         orig_write_log = core.write_run_log
+        orig_prefetcher = core.WindowPrefetcher
+
+        class DummyPrefetcher:
+            def __init__(self, *a, **kw):
+                pass
+            def start_prefetch(self, *a, **kw):
+                pass
+            def get_prefetched(self, *a, **kw):
+                return {}
+            def cancel(self):
+                pass
+
         captured_results = []
         core.run_batch = fake_run_batch
         core.write_run_log = lambda results, path: captured_results.extend(results)
+        core.WindowPrefetcher = DummyPrefetcher
         try:
             webgui.do_run(plan)
             self.assertEqual(len(captured_results), 2)
@@ -1007,6 +1022,7 @@ class TestWebGuiFeatures(unittest.TestCase):
         finally:
             core.run_batch = orig_run_batch
             core.write_run_log = orig_write_log
+            core.WindowPrefetcher = orig_prefetcher
 
     def test_repair_legacies_when_running_returns_409(self):
         import webgui
@@ -1463,6 +1479,2098 @@ class TestAuthLockoutCooldown(unittest.TestCase):
                 self.assertEqual(mock_sleep.call_count, 5)
 
 
+class TestBackgroundProcessor(unittest.TestCase):
+    """Unit tests for Core Background Processor and Concurrency-Throttled Task Queue."""
+
+    def test_fifo_execution_and_on_success(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        executed_tasks = []
+        success_results = []
+
+        def make_fn(tid):
+            def _fn():
+                executed_tasks.append(tid)
+                return f"res_{tid}"
+            return _fn
+
+        for i in range(5):
+            tid = f"task_{i}"
+            task = core.BackgroundTask(
+                task_id=tid,
+                camera_key="cam1",
+                fn=make_fn(tid),
+                on_success=success_results.append,
+            )
+            bp.submit(task)
+
+        finished = bp.wait_all(timeout=5.0)
+        self.assertTrue(finished)
+        self.assertEqual(executed_tasks, ["task_0", "task_1", "task_2", "task_3", "task_4"])
+        self.assertEqual(success_results, ["res_task_0", "res_task_1", "res_task_2", "res_task_3", "res_task_4"])
+        bp.shutdown(wait=True)
+
+    def test_task_args_and_kwargs(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        res_holder = []
+
+        def calc(a, b, multiplier=1):
+            return (a + b) * multiplier
+
+        task = core.BackgroundTask(
+            task_id="calc_1",
+            camera_key="cam1",
+            fn=calc,
+            args=(10, 20),
+            kwargs={"multiplier": 3},
+            on_success=res_holder.append,
+        )
+        bp.submit(task)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertEqual(res_holder, [90])
+        bp.shutdown(wait=True)
+
+    def test_concurrency_cap_verification(self):
+        import time as systime
+        max_workers = 2
+        bp = core.BackgroundProcessor(max_workers=max_workers)
+        active_count = 0
+        max_active_seen = 0
+        lock = threading.Lock()
+        barrier = threading.Barrier(max_workers)
+        completed = []
+
+        def concurrent_fn(task_idx):
+            nonlocal active_count, max_active_seen
+            with lock:
+                active_count += 1
+                if active_count > max_active_seen:
+                    max_active_seen = active_count
+            if task_idx < max_workers:
+                try:
+                    barrier.wait(timeout=2.0)
+                except threading.BrokenBarrierError:
+                    pass
+            systime.sleep(0.05)
+            with lock:
+                active_count -= 1
+            return task_idx
+
+        for i in range(5):
+            task = core.BackgroundTask(
+                task_id=f"concurrent_{i}",
+                camera_key=f"cam_{i}",
+                fn=concurrent_fn,
+                args=(i,),
+                on_success=completed.append,
+            )
+            bp.submit(task)
+
+        finished = bp.wait_all(timeout=5.0)
+        self.assertTrue(finished)
+        self.assertEqual(len(completed), 5)
+        self.assertEqual(max_active_seen, 2)
+        self.assertLessEqual(bp._peak_active_tasks, 2)
+        bp.shutdown(wait=True)
+
+    def test_error_isolation(self):
+        bp = core.BackgroundProcessor(max_workers=2)
+        successes = []
+        errors = []
+
+        def failing_fn():
+            raise ValueError("Task intentionally failed")
+
+        def normal_fn(val):
+            return val
+
+        t1 = core.BackgroundTask(
+            task_id="t1",
+            camera_key="cam1",
+            fn=normal_fn,
+            args=(1,),
+            on_success=successes.append,
+            on_error=errors.append,
+        )
+        t2 = core.BackgroundTask(
+            task_id="t2",
+            camera_key="cam2",
+            fn=failing_fn,
+            on_success=successes.append,
+            on_error=errors.append,
+        )
+        t3 = core.BackgroundTask(
+            task_id="t3",
+            camera_key="cam3",
+            fn=normal_fn,
+            args=(3,),
+            on_success=successes.append,
+            on_error=errors.append,
+        )
+
+        bp.submit(t1)
+        bp.submit(t2)
+        bp.submit(t3)
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertIn(1, successes)
+        self.assertIn(3, successes)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValueError)
+        self.assertEqual(str(errors[0]), "Task intentionally failed")
+
+        # Confirm workers remain healthy and process subsequent tasks
+        t4 = core.BackgroundTask(
+            task_id="t4",
+            camera_key="cam4",
+            fn=normal_fn,
+            args=(4,),
+            on_success=successes.append,
+            on_error=errors.append,
+        )
+        bp.submit(t4)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertIn(4, successes)
+        bp.shutdown(wait=True)
+
+    def test_temp_files_cleaned_up_on_error(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            tmp_path = f.name
+            f.write(b"temp data")
+
+        self.assertTrue(os.path.exists(tmp_path))
+
+        def failing_task():
+            raise RuntimeError("Task error")
+
+        task = core.BackgroundTask(
+            task_id="fail_clean",
+            camera_key="cam1",
+            fn=failing_task,
+            temp_files=[tmp_path],
+        )
+        bp.submit(task)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertFalse(os.path.exists(tmp_path))
+        bp.shutdown(wait=True)
+
+    def test_temp_files_preserved_on_success(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            tmp_path = f.name
+            f.write(b"temp data")
+
+        self.assertTrue(os.path.exists(tmp_path))
+
+        task = core.BackgroundTask(
+            task_id="succ_preserve",
+            camera_key="cam1",
+            fn=lambda: "ok",
+            temp_files=[tmp_path],
+        )
+        bp.submit(task)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertTrue(os.path.exists(tmp_path))
+        os.remove(tmp_path)
+        bp.shutdown(wait=True)
+
+    def test_cancellation_flushes_pending_tasks(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        task1_started = threading.Event()
+        task1_block = threading.Event()
+        task2_executed = threading.Event()
+        task2_errors = []
+
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            tmp_path2 = f.name
+
+        def task1_fn():
+            task1_started.set()
+            task1_block.wait(timeout=2.0)
+
+        def task2_fn():
+            task2_executed.set()
+
+        t1 = core.BackgroundTask(task_id="t1", camera_key="cam1", fn=task1_fn)
+        t2 = core.BackgroundTask(
+            task_id="t2",
+            camera_key="cam2",
+            fn=task2_fn,
+            temp_files=[tmp_path2],
+            on_error=task2_errors.append,
+        )
+
+        bp.submit(t1)
+        task1_started.wait(timeout=2.0)
+        bp.submit(t2)
+
+        bp.cancel()
+        task1_block.set()
+
+        res = bp.wait_all(timeout=5.0)
+        self.assertFalse(res)
+        self.assertTrue(bp.is_cancelled)
+        self.assertFalse(task2_executed.is_set())
+        self.assertEqual(len(task2_errors), 1)
+        self.assertIsInstance(task2_errors[0], core.Cancelled)
+        self.assertFalse(os.path.exists(tmp_path2))
+        bp.shutdown(wait=True)
+
+    def test_cancellation_kills_running_procs(self):
+        proc_registry = core.ProcRegistry()
+        mock_proc = MagicMock()
+        proc_registry.register(mock_proc)
+
+        bp = core.BackgroundProcessor(max_workers=1, proc_registry=proc_registry)
+        task_started = threading.Event()
+        task_block = threading.Event()
+
+        def block_fn():
+            task_started.set()
+            task_block.wait(timeout=2.0)
+
+        task = core.BackgroundTask(task_id="proc_task", camera_key="cam1", fn=block_fn)
+        bp.submit(task)
+        task_started.wait(timeout=2.0)
+
+        bp.cancel()
+        task_block.set()
+
+        bp.wait_all(timeout=2.0)
+        mock_proc.kill.assert_called()
+        bp.shutdown(wait=True)
+
+    def test_wait_all_barrier_synchronization(self):
+        import time as systime
+        bp = core.BackgroundProcessor(max_workers=2)
+        done_items = []
+
+        def worker_fn(val):
+            systime.sleep(0.02)
+            done_items.append(val)
+            return val
+
+        for i in range(6):
+            bp.submit(core.BackgroundTask(task_id=f"w_{i}", camera_key="cam", fn=worker_fn, args=(i,)))
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertEqual(len(done_items), 6)
+        self.assertEqual(bp.active_tasks, 0)
+        bp.shutdown(wait=True)
+
+    def test_wait_all_timeout(self):
+        import time as systime
+        bp = core.BackgroundProcessor(max_workers=1)
+        block_ev = threading.Event()
+
+        task = core.BackgroundTask(task_id="slow", camera_key="cam", fn=lambda: block_ev.wait(timeout=2.0))
+        bp.submit(task)
+
+        start_t = systime.monotonic()
+        res = bp.wait_all(timeout=0.1)
+        elapsed = systime.monotonic() - start_t
+
+        self.assertFalse(res)
+        self.assertLess(elapsed, 0.5)
+        block_ev.set()
+        bp.cancel()
+        bp.shutdown(wait=True)
+
+    def test_wait_all_unblocks_on_cancel_event(self):
+        import time as systime
+        cancel_ev = threading.Event()
+        bp = core.BackgroundProcessor(max_workers=1, cancel_event=cancel_ev)
+        block_ev = threading.Event()
+
+        task = core.BackgroundTask(task_id="slow_cancel", camera_key="cam", fn=lambda: block_ev.wait(timeout=2.0))
+        bp.submit(task)
+
+        def trigger():
+            systime.sleep(0.05)
+            cancel_ev.set()
+
+        threading.Thread(target=trigger, daemon=True).start()
+
+        start_t = systime.monotonic()
+        res = bp.wait_all(timeout=5.0)
+        elapsed = systime.monotonic() - start_t
+
+        self.assertFalse(res)
+        self.assertLess(elapsed, 1.5)
+        block_ev.set()
+        bp.shutdown(wait=True)
+
+    def test_submit_after_shutdown_raises(self):
+        bp = core.BackgroundProcessor(max_workers=1)
+        bp.shutdown(wait=True)
+        self.assertTrue(bp.is_shutdown)
+        with self.assertRaises(RuntimeError):
+            bp.submit(core.BackgroundTask(task_id="t", camera_key="c", fn=lambda: None))
+
+    def test_cli_remux_workers_argument(self):
+        import argparse
+        self.assertEqual(core.DEFAULT_REMUX_WORKERS, 2)
+
+        with patch("sys.argv", ["cctv_retrieve.py", "--remux-workers", "4"]):
+            ap = argparse.ArgumentParser()
+            ap.add_argument("--remux-workers", type=int, default=core.DEFAULT_REMUX_WORKERS)
+            args = ap.parse_args(["--remux-workers", "4"])
+            self.assertEqual(args.remux_workers, 4)
+
+            args_def = ap.parse_args([])
+            self.assertEqual(args_def.remux_workers, 2)
+
+
+class TestDecoupledRemuxing(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.orig_remux = core.remux_to_mp4
+
+    def tearDown(self):
+        core.remux_to_mp4 = self.orig_remux
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_camera_task_tracker_lifecycle_and_aggregation(self):
+        tracker = core.CameraTaskTracker()
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        cam_key = core.camera_key(row)
+        dummy_work_dir = os.path.join(self.test_dir, "work_dir")
+        os.makedirs(dummy_work_dir, exist_ok=True)
+
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        tracker.register_camera(cam_key, row=row, work_dir=dummy_work_dir, callbacks=cb)
+        self.assertTrue(tracker.has_camera(cam_key))
+        self.assertTrue(tracker.has_pending_tasks(cam_key))
+
+        # Submit 2 tasks
+        tracker.task_submitted(cam_key, "t1")
+        tracker.task_submitted(cam_key, "t2")
+
+        # Download finishes while tasks are running -> stage 'remuxing'
+        tracker.complete_download(cam_key, result={"notes": ["download note"], "files": ["existing.mp4"]})
+        self.assertEqual(stages[-1][0], "remuxing")
+        self.assertFalse(tracker.is_finalized(cam_key))
+        self.assertTrue(os.path.exists(dummy_work_dir))
+
+        # Task 1 completes
+        tracker.task_completed(cam_key, "t1", file="seg1.mp4", notes=["remux1 ok"])
+        self.assertFalse(tracker.is_finalized(cam_key))
+        self.assertTrue(os.path.exists(dummy_work_dir))
+
+        # Task 2 completes -> all finished -> stage 'ok' and work_dir cleaned up
+        tracker.task_completed(cam_key, "t2", file="seg2.mp4", notes=["remux2 ok"])
+        self.assertTrue(tracker.is_finalized(cam_key))
+        self.assertEqual(stages[-1][0], "ok")
+        self.assertFalse(os.path.exists(dummy_work_dir))
+
+        res = tracker.get_result(cam_key)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["files"], ["existing.mp4", "seg1.mp4", "seg2.mp4"])
+        self.assertIn("download note", res["notes"])
+        self.assertIn("remux1 ok", res["notes"])
+        self.assertIn("remux2 ok", res["notes"])
+
+    def test_process_camera_pipelined_segment_downloads(self):
+        """Verify that download for segment 2 is called before remux for segment 1 finishes."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        t2 = datetime(2026, 9, 10, 10, 20, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        s2 = core.Segment(uri="u2", name="seg2", start=t1, end=t2, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1, s2])
+
+        class DummyArgs:
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+        seg1_remux_started = threading.Event()
+        seg2_download_started = threading.Event()
+        seg1_remux_finished = threading.Event()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+                if seg.name == "seg2":
+                    # Crucial pipelining assertion: seg1 remux must NOT have finished yet!
+                    test_case.assertFalse(
+                        seg1_remux_finished.is_set(),
+                        "Segment 2 download started, but Segment 1 remux had already finished!"
+                    )
+                    seg2_download_started.set()
+
+        test_case = self
+
+        def fake_remux(src, dst, proc_reg, cancel_ev):
+            if "seg1" in src:
+                seg1_remux_started.set()
+                # Segment 1 remux waits until segment 2 has started downloading!
+                seg2_download_started.wait(timeout=5.0)
+                with open(dst, "wb") as f:
+                    f.write(b"mp4_1")
+                seg1_remux_finished.set()
+                return True, ""
+            else:
+                with open(dst, "wb") as f:
+                    f.write(b"mp4_2")
+                return True, ""
+
+        core.remux_to_mp4 = fake_remux
+
+        bp = core.BackgroundProcessor(max_workers=2)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        res = core.process_camera(
+            plan, args, t0, t2, MockClient(), run_dir, core.Callbacks(), proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker
+        )
+        self.assertTrue(res["ok"])
+        self.assertTrue(seg2_download_started.is_set())
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertTrue(seg1_remux_started.is_set())
+        self.assertTrue(seg1_remux_finished.is_set())
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        self.assertEqual(len(final_res["files"]), 2)
+        bp.shutdown(wait=True)
+
+    def test_run_batch_early_nvr_slot_release(self):
+        """Configure 2 cameras on the same NVR with per_nvr=1.
+        Verify Camera 2 starts downloading immediately after Camera 1 finishes its network download,
+        while Camera 1's remux is still executing in the background.
+        """
+        row_a = {"name": "CamA", "nvr": "192.168.1.10", "channel": "D1"}
+        row_b = {"name": "CamB", "nvr": "192.168.1.10", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        sa = core.Segment(uri="u1", name="seg_a", start=t0, end=t1, size=1000)
+        sb = core.Segment(uri="u2", name="seg_b", start=t0, end=t1, size=1000)
+        plan_a = core.CameraPlan(row=row_a, key=core.camera_key(row_a), track_id=101, segments=[sa])
+        plan_b = core.CameraPlan(row=row_b, key=core.camera_key(row_b), track_id=102, segments=[sb])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        cam_a_remux_started = threading.Event()
+        cam_b_download_started = threading.Event()
+        cam_a_remux_finished = threading.Event()
+
+        orig_plan_camera = core.plan_camera
+        orig_mark_existing = core.mark_existing
+        try:
+            def fake_plan_camera(r, client, start, end, mode, **kw):
+                if r["channel"] == "D1":
+                    return plan_a
+                return plan_b
+
+            core.plan_camera = fake_plan_camera
+            core.mark_existing = lambda p, args, start, end: None
+
+            orig_download = core.NvrClient.download
+
+            def fake_download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+                if seg.name == "seg_b":
+                    cam_b_download_started.set()
+
+            core.NvrClient.download = fake_download
+
+            def fake_remux(src, dst, proc_reg, cancel_ev):
+                if "seg_a" in src:
+                    cam_a_remux_started.set()
+                    # Wait for Camera B download to start!
+                    # If NVR slot was not released early, Camera B could never download while Cam A remuxes!
+                    cam_b_download_started.wait(timeout=5.0)
+                    with open(dst, "wb") as f:
+                        f.write(b"mp4_a")
+                    cam_a_remux_finished.set()
+                    return True, ""
+                else:
+                    with open(dst, "wb") as f:
+                        f.write(b"mp4_b")
+                    return True, ""
+
+            core.remux_to_mp4 = fake_remux
+
+            results = core.run_batch([row_a, row_b], args, t0, t1)
+
+            self.assertTrue(cam_b_download_started.is_set())
+            self.assertTrue(cam_a_remux_finished.is_set())
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(r["ok"] for r in results))
+            self.assertEqual(sum(len(r["files"]) for r in results), 2)
+        finally:
+            core.plan_camera = orig_plan_camera
+            core.mark_existing = orig_mark_existing
+            core.NvrClient.download = orig_download
+
+    def test_remux_failure_propagates_to_camera_result(self):
+        """Simulate ffmpeg failure in background remux; verify camera result is marked ok=False with appropriate error."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+
+        def fake_failing_remux(src, dst, proc_reg, cancel_ev):
+            return False, "corrupted moov atom"
+
+        core.remux_to_mp4 = fake_failing_remux
+
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t1, MockClient(), run_dir, cb, proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker
+        )
+        bp.wait_all(timeout=5.0)
+
+        final_res = tracker.get_result(plan.key)
+        self.assertFalse(final_res["ok"])
+        self.assertTrue(any("corrupted moov atom" in err for err in final_res["errors"]))
+        self.assertEqual(stages[-1][0], "fail")
+        bp.shutdown(wait=True)
+
+    def test_backward_compatibility_sync_process_camera(self):
+        """Call process_camera with bg_processor=None; verify it runs synchronously and returns identical result structures."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+
+        def fake_sync_remux(src, dst, proc_reg, cancel_ev):
+            with open(dst, "wb") as f:
+                f.write(b"sync_mp4")
+            return True, ""
+
+        core.remux_to_mp4 = fake_sync_remux
+
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        # Called with bg_processor=None (default)
+        res = core.process_camera(
+            plan, args, t0, t1, MockClient(), run_dir, cb, proc_reg, None
+        )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["files"]), 1)
+        self.assertTrue(os.path.exists(res["files"][0]))
+        self.assertEqual(stages[-1][0], "ok")
+        # Ensure work_dir was cleaned up
+        cam_work_dir = os.path.join(run_dir, core.safe_name(plan.key))
+        self.assertFalse(os.path.exists(cam_work_dir))
+
+
+class TestAsyncTrimAndLegacyOffloading(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="cctv_trim_test_")
+        self.orig_cut_clip = core.cut_clip
+        self.orig_repair_legacy = core.repair_legacy_file
+        self.orig_remux = core.remux_to_mp4
+        self.orig_plan = core.plan_camera
+        self.orig_mark = core.mark_existing
+        self.orig_download = core.NvrClient.download
+        self.orig_snapshot_clip = core.snapshot_from_clip
+
+    def tearDown(self):
+        core.cut_clip = self.orig_cut_clip
+        core.repair_legacy_file = self.orig_repair_legacy
+        core.remux_to_mp4 = self.orig_remux
+        core.plan_camera = self.orig_plan
+        core.mark_existing = self.orig_mark
+        core.NvrClient.download = self.orig_download
+        core.snapshot_from_clip = self.orig_snapshot_clip
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _create_legacy_file(self, path):
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
+            "-c:v", "libx264", "-f", "vob", path,
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+    def test_trim_mode_releases_nvr_slot_before_cut(self):
+        """Verify that in trim mode, active[host] is decremented before cut_clip starts/finishes in background."""
+        row_a = {"name": "CamA", "nvr": "192.168.1.10", "channel": "D1"}
+        row_b = {"name": "CamB", "nvr": "192.168.1.10", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        sa = core.Segment(uri="u1", name="seg_a", start=t0, end=t1, size=1000)
+        sb = core.Segment(uri="u2", name="seg_b", start=t0, end=t1, size=1000)
+        plan_a = core.CameraPlan(row=row_a, key=core.camera_key(row_a), track_id=101, segments=[sa])
+        plan_b = core.CameraPlan(row=row_b, key=core.camera_key(row_b), track_id=102, segments=[sb])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = True
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        cam_a_cut_started = threading.Event()
+        cam_b_download_started = threading.Event()
+        cam_a_cut_finished = threading.Event()
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            return plan_a if r["channel"] == "D1" else plan_b
+
+        core.plan_camera = fake_plan_camera
+        core.mark_existing = lambda p, args, start, end: None
+
+        def fake_download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+            if seg.name == "seg_b":
+                cam_b_download_started.set()
+
+        core.NvrClient.download = fake_download
+
+        def fake_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            if "CamA" in out_path:
+                cam_a_cut_started.set()
+                # Wait for Camera B download to start!
+                # If NVR slot was not released early, Camera B could never download while Cam A cuts!
+                cam_b_download_started.wait(timeout=5.0)
+                with open(out_path, "wb") as f:
+                    f.write(b"cut_mp4_a")
+                cam_a_cut_finished.set()
+                return True, ""
+            else:
+                with open(out_path, "wb") as f:
+                    f.write(b"cut_mp4_b")
+                return True, ""
+
+        core.cut_clip = fake_cut
+
+        results = core.run_batch([row_a, row_b], args, t0, t1)
+
+        self.assertTrue(cam_b_download_started.is_set())
+        self.assertTrue(cam_a_cut_finished.is_set())
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertEqual(sum(len(r["files"]) for r in results), 2)
+
+    def test_cut_clip_background_success(self):
+        """Multi-segment trim completes in background, creates valid .mp4, and cleans scratch files."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 5, 0)
+        t2 = datetime(2026, 9, 10, 10, 10, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        s2 = core.Segment(uri="u2", name="seg2", start=t1, end=t2, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1, s2])
+
+        class DummyArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"dummy segment data")
+
+        cut_executed = threading.Event()
+
+        def fake_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            cut_executed.set()
+            self.assertEqual(len(parts), 2)
+            self.assertTrue(os.path.isdir(work_dir))
+            with open(out_path, "wb") as f:
+                f.write(b"mp4 content")
+            return True, ""
+
+        core.cut_clip = fake_cut
+
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t2, MockClient(), run_dir, cb, proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        self.assertTrue(cut_executed.is_set())
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        self.assertEqual(len(final_res["files"]), 1)
+        self.assertTrue(os.path.exists(final_res["files"][0]))
+
+        stage_names = [s[0] for s in stages]
+        self.assertIn("cutting", stage_names)
+        self.assertEqual(stage_names[-1], "ok")
+
+        cam_work_dir = os.path.join(run_dir, core.safe_name(plan.key))
+        self.assertFalse(os.path.exists(cam_work_dir))
+        bp.shutdown(wait=True)
+
+    def test_cut_clip_background_failure(self):
+        """Simulate ffmpeg concat error; verify camera status is set to fail, error is reported, and temporary files in work_dir are cleaned up."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 5, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+
+        def fake_failing_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            return False, "corrupted concat list"
+
+        core.cut_clip = fake_failing_cut
+
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t1, MockClient(), run_dir, cb, proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+
+        final_res = tracker.get_result(plan.key)
+        self.assertFalse(final_res["ok"])
+        self.assertTrue(any("corrupted concat list" in err for err in final_res["errors"]))
+        self.assertEqual(stages[-1][0], "fail")
+
+        cam_work_dir = os.path.join(run_dir, core.safe_name(plan.key))
+        self.assertFalse(os.path.exists(cam_work_dir))
+        bp.shutdown(wait=True)
+
+    def test_legacy_repair_offloaded_to_background(self):
+        """Pre-existing legacy files on disk are queued and converted by the background processor without blocking download slots."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+        raw_dest = core.raw_segment_path(row, s1, self.test_dir)
+        os.makedirs(os.path.dirname(raw_dest), exist_ok=True)
+        self._create_legacy_file(raw_dest)
+        self.assertFalse(core.is_real_mp4(raw_dest))
+
+        core.mark_existing(plan, args, t0, t1)
+        self.assertIn("seg1", plan.legacy)
+
+        class MockClient:
+            host = "192.168.1.10"
+            download_calls = 0
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                self.download_calls += 1
+
+        client = MockClient()
+        stages = []
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stages.append((stage, info))
+
+        cb = MockCallbacks()
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t1, client, run_dir, cb, proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertEqual(client.download_calls, 0)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        self.assertEqual(len(final_res["files"]), 1)
+        self.assertEqual(final_res["files"][0], raw_dest)
+        self.assertTrue(core.is_real_mp4(raw_dest))
+        self.assertTrue(any("converted legacy file" in note for note in final_res["notes"]))
+        self.assertEqual(stages[-1][0], "ok")
+        bp.shutdown(wait=True)
+
+    def test_trimmed_legacy_clip_offloaded_to_background(self):
+        """Pre-existing trimmed legacy clip is queued and repaired by BackgroundProcessor."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 0, 1)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+
+        args = DummyArgs()
+        clip_path = core.output_base(row, t0, self.test_dir) + ".mp4"
+        os.makedirs(os.path.dirname(clip_path), exist_ok=True)
+        self._create_legacy_file(clip_path)
+        self.assertFalse(core.is_real_mp4(clip_path))
+
+        core.mark_existing(plan, args, t0, t1)
+        self.assertTrue(plan.legacy_clip)
+
+        class MockClient:
+            host = "192.168.1.10"
+            download_calls = 0
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                self.download_calls += 1
+
+        client = MockClient()
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t1, client, run_dir, core.Callbacks(), proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertEqual(client.download_calls, 0)
+        self.assertTrue(bp.wait_all(timeout=5.0))
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        self.assertEqual(len(final_res["files"]), 1)
+        self.assertEqual(final_res["files"][0], clip_path)
+        self.assertTrue(core.is_real_mp4(clip_path))
+        self.assertTrue(any("converted legacy clip" in note for note in final_res["notes"]))
+        bp.shutdown(wait=True)
+
+    def test_cut_clip_background_mode_both(self):
+        """In trim mode with mode=='both', background cut task generates .mp4 and extracts snapshot .jpg."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 5, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "both"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+
+        def fake_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            with open(out_path, "wb") as f:
+                f.write(b"mp4 content")
+            return True, ""
+
+        def fake_snapshot_clip(clip_path, out_path, proc_registry, cancel_event):
+            with open(out_path, "wb") as f:
+                f.write(b"jpg content")
+            return True, ""
+
+        core.cut_clip = fake_cut
+        core.snapshot_from_clip = fake_snapshot_clip
+
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan, args, t0, t1, MockClient(), run_dir, core.Callbacks(), proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        self.assertEqual(len(final_res["files"]), 2)
+        base = core.output_base(row, t0, self.test_dir)
+        self.assertIn(base + ".mp4", final_res["files"])
+        self.assertIn(base + ".jpg", final_res["files"])
+        bp.shutdown(wait=True)
+
+
+class TestDecoupledSnapshotQuotas(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="cctv_snap_test_")
+        self.orig_snapshot_rtsp = core.snapshot_via_rtsp
+        self.orig_snapshot_clip = core.snapshot_from_clip
+        self.orig_cut_clip = core.cut_clip
+        self.orig_remux = core.remux_to_mp4
+        self.orig_plan = core.plan_camera
+        self.orig_mark = core.mark_existing
+        self.orig_download = core.NvrClient.download
+
+    def tearDown(self):
+        core.snapshot_via_rtsp = self.orig_snapshot_rtsp
+        core.snapshot_from_clip = self.orig_snapshot_clip
+        core.cut_clip = self.orig_cut_clip
+        core.remux_to_mp4 = self.orig_remux
+        core.plan_camera = self.orig_plan
+        core.mark_existing = self.orig_mark
+        core.NvrClient.download = self.orig_download
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_snapshot_in_both_mode_nonblocking(self):
+        """In mode == 'both', NVR download slot is released while RTSP snapshot executes in background."""
+        row_a = {"name": "CamA", "nvr": "192.168.1.10", "channel": "D1"}
+        row_b = {"name": "CamB", "nvr": "192.168.1.10", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        sa = core.Segment(uri="u1", name="seg_a", start=t0, end=t1, size=1000)
+        sb = core.Segment(uri="u2", name="seg_b", start=t0, end=t1, size=1000)
+        plan_a = core.CameraPlan(row=row_a, key=core.camera_key(row_a), track_id=101, segments=[sa])
+        plan_b = core.CameraPlan(row=row_b, key=core.camera_key(row_b), track_id=102, segments=[sb])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "both"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        cam_a_snap_started = threading.Event()
+        cam_b_download_started = threading.Event()
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            return plan_a if r["channel"] == "D1" else plan_b
+
+        core.plan_camera = fake_plan_camera
+        core.mark_existing = lambda p, args, start, end: None
+
+        def fake_download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+            if seg.name == "seg_b":
+                cam_b_download_started.set()
+
+        core.NvrClient.download = fake_download
+
+        def fake_remux(src, dest, proc_registry, cancel_event):
+            with open(dest, "wb") as f:
+                f.write(b"mp4_data")
+            return True, ""
+
+        core.remux_to_mp4 = fake_remux
+
+        def fake_snapshot_rtsp(host, track_id, start, user, password, out_path, timeout_s, proc_registry, cancel_event):
+            if track_id == 101:
+                cam_a_snap_started.set()
+                # Cam B must be able to start downloading while Cam A's snapshot is running!
+                # If NVR slot was not released early, Cam B would be blocked by per_nvr=1.
+                cam_b_download_started.wait(timeout=5.0)
+            with open(out_path, "wb") as f:
+                f.write(b"jpg_data")
+            return True, ""
+
+        core.snapshot_via_rtsp = fake_snapshot_rtsp
+
+        results = core.run_batch([row_a, row_b], args, t0, t1)
+
+        self.assertTrue(cam_a_snap_started.is_set())
+        self.assertTrue(cam_b_download_started.is_set())
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        base_a = core.output_base(row_a, t0, self.test_dir)
+        base_b = core.output_base(row_b, t0, self.test_dir)
+        res_a = next(r for r in results if r["channel"] == "D1")
+        res_b = next(r for r in results if r["channel"] == "D2")
+        self.assertIn(base_a + ".jpg", res_a["files"])
+        self.assertIn(base_b + ".jpg", res_b["files"])
+
+    def test_snapshot_from_clip_chained_after_trim(self):
+        """In trim mode with both, snapshot is generated from clip in background."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 5, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+        plan = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "both"
+            timeout = 10
+
+        args = DummyArgs()
+
+        class MockClient:
+            host = "192.168.1.10"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"raw_data")
+
+        cut_calls = []
+
+        def fake_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            cut_calls.append(out_path)
+            with open(out_path, "wb") as f:
+                f.write(b"mp4 content")
+            return True, ""
+
+        snap_calls = []
+
+        def fake_snapshot_clip(clip_path, out_path, proc_registry, cancel_event):
+            snap_calls.append((clip_path, out_path))
+            with open(out_path, "wb") as f:
+                f.write(b"jpg content")
+            return True, ""
+
+        core.cut_clip = fake_cut
+        core.snapshot_from_clip = fake_snapshot_clip
+
+        bp = core.BackgroundProcessor(max_workers=1)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch")
+        proc_reg = core.ProcRegistry()
+        stage_events = []
+
+        class TrackingCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stage_events.append(stage)
+
+        cb = TrackingCallbacks()
+
+        core.process_camera(
+            plan, args, t0, t1, MockClient(), run_dir, cb, proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+
+        final_res = tracker.get_result(plan.key)
+        self.assertTrue(final_res["ok"])
+        base = core.output_base(row, t0, self.test_dir)
+        self.assertEqual(len(cut_calls), 1)
+        self.assertEqual(cut_calls[0], base + ".mp4")
+        self.assertEqual(len(snap_calls), 1)
+        self.assertEqual(snap_calls[0], (base + ".mp4", base + ".jpg"))
+        self.assertIn(base + ".mp4", final_res["files"])
+        self.assertIn(base + ".jpg", final_res["files"])
+        self.assertIn("snapshot", stage_events)
+        bp.shutdown(wait=True)
+
+    def test_snapshot_warning_does_not_fail_camera(self):
+        """Snapshot failure records warning note and camera stays ok=True."""
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 5, 0)
+        s1 = core.Segment(uri="u1", name="seg1", start=t0, end=t1, size=1000)
+        row = {"name": "Cam01", "nvr": "192.168.1.10", "channel": "D1"}
+
+        class MockClient:
+            host = "192.168.1.10"
+            active_password = "pwd"
+
+            def download(self, seg, dest, on_bytes=None, on_length=None, cancel_event=None, on_status=None):
+                with open(dest, "wb") as f:
+                    f.write(b"data")
+
+        # 1. Non-trim mode (RTSP snapshot failure)
+        plan_rtsp = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyNoTrimArgs:
+            trim = False
+            output_dir = self.test_dir
+            mode = "both"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        def fake_remux(src, dest, proc_registry, cancel_event):
+            with open(dest, "wb") as f:
+                f.write(b"mp4_data")
+            return True, ""
+
+        def fake_snapshot_rtsp_fail(host, track_id, start, user, password, out_path, timeout_s, proc_registry, cancel_event):
+            return False, "rtsp connection timed out"
+
+        core.remux_to_mp4 = fake_remux
+        core.snapshot_via_rtsp = fake_snapshot_rtsp_fail
+
+        bp = core.BackgroundProcessor(max_workers=2)
+        tracker = core.CameraTaskTracker()
+        run_dir = os.path.join(self.test_dir, "run_scratch_1")
+        proc_reg = core.ProcRegistry()
+
+        core.process_camera(
+            plan_rtsp, DummyNoTrimArgs(), t0, t1, MockClient(), run_dir, core.Callbacks(), proc_reg, None,
+            bg_processor=bp, camera_tracker=tracker,
+        )
+
+        self.assertTrue(bp.wait_all(timeout=5.0))
+        res_rtsp = tracker.get_result(plan_rtsp.key)
+        self.assertTrue(res_rtsp["ok"], "Camera must remain ok=True when snapshot fails")
+        self.assertEqual(len(res_rtsp["errors"]), 0)
+        self.assertTrue(any("snapshot failed (clip saved): rtsp connection timed out" in n for n in res_rtsp["notes"]))
+        self.assertTrue(any(f.endswith(".mp4") for f in res_rtsp["files"]))
+        bp.shutdown(wait=True)
+
+        # 2. Trim mode (clip snapshot failure)
+        plan_trim = core.CameraPlan(row=row, key=core.camera_key(row), track_id=101, segments=[s1])
+
+        class DummyTrimArgs:
+            trim = True
+            output_dir = self.test_dir
+            mode = "both"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        def fake_cut(parts, out_path, proc_registry, cancel_event, work_dir):
+            with open(out_path, "wb") as f:
+                f.write(b"cut_mp4")
+            return True, ""
+
+        def fake_snapshot_clip_fail(clip_path, out_path, proc_registry, cancel_event):
+            return False, "moov atom not found"
+
+        core.cut_clip = fake_cut
+        core.snapshot_from_clip = fake_snapshot_clip_fail
+
+        bp2 = core.BackgroundProcessor(max_workers=2)
+        tracker2 = core.CameraTaskTracker()
+        run_dir2 = os.path.join(self.test_dir, "run_scratch_2")
+
+        core.process_camera(
+            plan_trim, DummyTrimArgs(), t0, t1, MockClient(), run_dir2, core.Callbacks(), proc_reg, None,
+            bg_processor=bp2, camera_tracker=tracker2,
+        )
+
+        self.assertTrue(bp2.wait_all(timeout=5.0))
+        res_trim = tracker2.get_result(plan_trim.key)
+        self.assertTrue(res_trim["ok"], "Camera must remain ok=True when snapshot fails in trim mode")
+        self.assertEqual(len(res_trim["errors"]), 0)
+        self.assertTrue(any("snapshot failed (clip saved): moov atom not found" in n for n in res_trim["notes"]))
+        base = core.output_base(row, t0, self.test_dir)
+        self.assertIn(base + ".mp4", res_trim["files"])
+        self.assertNotIn(base + ".jpg", res_trim["files"])
+        bp2.shutdown(wait=True)
+
+    def test_snapshot_cancelled_promptly(self):
+        """ProcRegistry kills ffmpeg if cancelled."""
+        import time as systime
+        proc_reg = core.ProcRegistry()
+        cancel_ev = threading.Event()
+        mock_proc = MagicMock()
+        proc_killed = threading.Event()
+
+        def fake_kill():
+            proc_killed.set()
+
+        mock_proc.kill.side_effect = fake_kill
+        mock_proc.returncode = -9
+
+        def fake_communicate(timeout=None):
+            proc_killed.wait(timeout=2.0)
+            return (b"", b"Killed")
+
+        mock_proc.communicate.side_effect = fake_communicate
+
+        cancelled_caught = threading.Event()
+
+        def run_target():
+            try:
+                core.snapshot_via_rtsp(
+                    "192.168.1.10", 101, datetime(2026, 9, 10, 10, 0, 0),
+                    "admin", "pwd", os.path.join(self.test_dir, "snap.jpg"),
+                    10, proc_reg, cancel_ev,
+                )
+            except core.Cancelled:
+                cancelled_caught.set()
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            t = threading.Thread(target=run_target)
+            t.start()
+
+            start_time = systime.time()
+            while not proc_reg._procs and systime.time() - start_time < 2.0:
+                systime.sleep(0.01)
+
+            self.assertIn(mock_proc, proc_reg._procs)
+
+            cancel_ev.set()
+            proc_reg.kill_all()
+
+            t.join(timeout=3.0)
+            self.assertFalse(t.is_alive())
+            mock_proc.kill.assert_called()
+            self.assertTrue(cancelled_caught.is_set())
+
+
+class TestStreamingSearchPipeline(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.orig_plan_camera = core.plan_camera
+        self.orig_mark_existing = core.mark_existing
+        self.orig_download = core.NvrClient.download
+        self.orig_remux = core.remux_to_mp4
+
+    def tearDown(self):
+        core.plan_camera = self.orig_plan_camera
+        core.mark_existing = self.orig_mark_existing
+        core.NvrClient.download = self.orig_download
+        core.remux_to_mp4 = self.orig_remux
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_intra_batch_streaming_tail_latency_elimination(self):
+        """Fast camera search (0.05s) starts downloading immediately while slow camera search (0.5s) is still running."""
+        row_fast = {"name": "CamFast", "nvr": "192.168.1.10", "channel": "D1"}
+        row_slow = {"name": "CamSlow", "nvr": "192.168.1.20", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s_fast = core.Segment(uri="u1", name="seg_fast", start=t0, end=t1, size=1000)
+        s_slow = core.Segment(uri="u2", name="seg_slow", start=t0, end=t1, size=1000)
+        plan_fast = core.CameraPlan(row=row_fast, key=core.camera_key(row_fast), track_id=101, segments=[s_fast])
+        plan_slow = core.CameraPlan(row=row_slow, key=core.camera_key(row_slow), track_id=102, segments=[s_slow])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        slow_search_started = threading.Event()
+        fast_download_started = threading.Event()
+
+        search_times = {}
+        download_times = {}
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            if r["name"] == "CamFast":
+                systime.sleep(0.05)
+                search_times["fast_search_end"] = systime.time()
+                return plan_fast
+            else:
+                slow_search_started.set()
+                # CamSlow simulates a slow NVR search (0.5s)
+                systime.sleep(0.5)
+                search_times["slow_search_end"] = systime.time()
+                return plan_slow
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            download_times[seg.name] = systime.time()
+            with open(dest, "wb") as f:
+                f.write(b"data")
+            if seg.name == "seg_fast":
+                fast_download_started.set()
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_batch([row_fast, row_slow], args, t0, t1)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertTrue(fast_download_started.is_set())
+        self.assertIn("seg_fast", download_times)
+        self.assertIn("slow_search_end", search_times)
+        # CamFast download started before CamSlow search finished!
+        self.assertLess(download_times["seg_fast"], search_times["slow_search_end"])
+
+    def test_concurrency_limits_during_streaming_search(self):
+        """Verify active downloads never exceed args.workers globally or args.per_nvr per NVR."""
+        rows = [
+            {"name": "Cam1", "nvr": "192.168.1.10", "channel": "D1"},
+            {"name": "Cam2", "nvr": "192.168.1.10", "channel": "D2"},
+            {"name": "Cam3", "nvr": "192.168.1.20", "channel": "D3"},
+            {"name": "Cam4", "nvr": "192.168.1.20", "channel": "D4"},
+        ]
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            idx = int(r["name"][-1])
+            systime.sleep(0.01 * idx)
+            seg = core.Segment(uri=f"u{idx}", name=f"seg{idx}", start=t0, end=t1, size=1000)
+            return core.CameraPlan(row=r, key=core.camera_key(r), track_id=100 + idx, segments=[seg])
+
+        core.plan_camera = fake_plan_camera
+
+        active_global = 0
+        max_global_seen = 0
+        active_per_nvr = collections.Counter()
+        max_per_nvr_seen = collections.Counter()
+        lock = threading.Lock()
+
+        def fake_download(self, seg, dest, **kw):
+            nonlocal active_global, max_global_seen
+            with lock:
+                active_global += 1
+                active_per_nvr[self.host] += 1
+                if active_global > max_global_seen:
+                    max_global_seen = active_global
+                if active_per_nvr[self.host] > max_per_nvr_seen[self.host]:
+                    max_per_nvr_seen[self.host] = active_per_nvr[self.host]
+
+            systime.sleep(0.05)
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+            with lock:
+                active_global -= 1
+                active_per_nvr[self.host] -= 1
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_batch(rows, args, t0, t1)
+
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertLessEqual(max_global_seen, args.workers)
+        self.assertEqual(max_global_seen, args.workers)
+        for host in ["192.168.1.10", "192.168.1.20"]:
+            self.assertLessEqual(max_per_nvr_seen[host], args.per_nvr)
+
+    def test_prefetched_plans_bypasses_search_pool(self):
+        """Passing prefetched_plans starts downloads without invoking search."""
+        row_a = {"name": "CamA", "nvr": "192.168.1.10", "channel": "D1"}
+        row_b = {"name": "CamB", "nvr": "192.168.1.20", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s_a = core.Segment(uri="u1", name="seg_a", start=t0, end=t1, size=1000)
+        s_b = core.Segment(uri="u2", name="seg_b", start=t0, end=t1, size=1000)
+        plan_a = core.CameraPlan(row=row_a, key=core.camera_key(row_a), track_id=101, segments=[s_a])
+        plan_b = core.CameraPlan(row=row_b, key=core.camera_key(row_b), track_id=102, segments=[s_b])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        def forbidden_search(*a, **kw):
+            raise AssertionError("Search pool should not be invoked for prefetched plans")
+
+        core.plan_camera = forbidden_search
+
+        stages_recorded = collections.defaultdict(list)
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stages_recorded[key].append(stage)
+
+        cb = MockCallbacks()
+
+        def fake_download(self, seg, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        prefetched = {plan_a.key: plan_a, plan_b.key: plan_b}
+        results = core.run_batch([row_a, row_b], args, t0, t1, callbacks=cb, prefetched_plans=prefetched)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertNotIn("searching", stages_recorded[plan_a.key])
+        self.assertNotIn("searching", stages_recorded[plan_b.key])
+        self.assertIn("queued", stages_recorded[plan_a.key])
+        self.assertIn("queued", stages_recorded[plan_b.key])
+
+    def test_error_isolation_during_streaming_search(self):
+        """Camera failing search records failure immediately and does not prevent others from downloading."""
+        row_err = {"name": "CamErr", "nvr": "192.168.1.10", "channel": "D1"}
+        row_ok = {"name": "CamOk", "nvr": "192.168.1.20", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s_ok = core.Segment(uri="u2", name="seg_ok", start=t0, end=t1, size=1000)
+        plan_err = core.CameraPlan(row=row_err, key=core.camera_key(row_err), track_id=101, segments=[])
+        plan_err.error = "no recording on NVR for track 101"
+        plan_ok = core.CameraPlan(row=row_ok, key=core.camera_key(row_ok), track_id=102, segments=[s_ok])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            if r["name"] == "CamErr":
+                return plan_err
+            return plan_ok
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_batch([row_err, row_ok], args, t0, t1)
+
+        self.assertEqual(len(results), 2)
+        res_err = next(r for r in results if r["name"] == "CamErr")
+        res_ok = next(r for r in results if r["name"] == "CamOk")
+        self.assertFalse(res_err["ok"])
+        self.assertIn("no recording on NVR for track 101", res_err["errors"])
+        self.assertTrue(res_ok["ok"])
+        self.assertEqual(len(res_ok["files"]), 1)
+
+    def test_prefetched_plans_with_error(self):
+        """Camera with error in prefetched_plans fails immediately without downloading."""
+        row_err = {"name": "CamErr", "nvr": "192.168.1.10", "channel": "D1"}
+        row_ok = {"name": "CamOk", "nvr": "192.168.1.20", "channel": "D2"}
+        t0 = datetime(2026, 9, 10, 10, 0, 0)
+        t1 = datetime(2026, 9, 10, 10, 10, 0)
+        s_ok = core.Segment(uri="u2", name="seg_ok", start=t0, end=t1, size=1000)
+        plan_err = core.CameraPlan(row=row_err, key=core.camera_key(row_err), track_id=101, segments=[])
+        plan_err.error = "search timeout"
+        plan_ok = core.CameraPlan(row=row_ok, key=core.camera_key(row_ok), track_id=102, segments=[s_ok])
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        def forbidden_search(*a, **kw):
+            raise AssertionError("plan_camera should not be called")
+
+        core.plan_camera = forbidden_search
+
+        def fake_download(self, seg, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        stages_recorded = collections.defaultdict(list)
+
+        class MockCallbacks(core.Callbacks):
+            def stage(self, key, stage, row=None, **info):
+                stages_recorded[key].append(stage)
+
+        cb = MockCallbacks()
+
+        prefetched = {plan_err.key: plan_err, plan_ok.key: plan_ok}
+        results = core.run_batch([row_err, row_ok], args, t0, t1, callbacks=cb, prefetched_plans=prefetched)
+
+        self.assertEqual(len(results), 2)
+        res_err = next(r for r in results if r["name"] == "CamErr")
+        res_ok = next(r for r in results if r["name"] == "CamOk")
+        self.assertFalse(res_err["ok"])
+        self.assertIn("search timeout", res_err["errors"])
+        self.assertTrue(res_ok["ok"])
+        self.assertIn("fail", stages_recorded[plan_err.key])
+        self.assertIn("queued", stages_recorded[plan_ok.key])
+
+
+class TestWindowPrefetching(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="cctv_prefetch_")
+        self._orig_plan_camera = core.plan_camera
+        self._orig_mark_existing = core.mark_existing
+        self._orig_download = core.NvrClient.download
+        self._orig_remux = core.remux_to_mp4
+
+    def tearDown(self):
+        core.plan_camera = self._orig_plan_camera
+        core.mark_existing = self._orig_mark_existing
+        core.NvrClient.download = self._orig_download
+        core.remux_to_mp4 = self._orig_remux
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_window_prefetcher_concurrent_execution(self):
+        """Verifies that prefetch search for Window 2 executes concurrently while Window 1 is running."""
+        rows = [
+            {"name": "Cam1", "nvr": "192.168.1.10", "channel": "D1"},
+            {"name": "Cam2", "nvr": "192.168.1.20", "channel": "D2"},
+        ]
+        w1 = (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 11, 0, 0))
+        w2 = (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 11, 0, 0))
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        w1_download_started = threading.Event()
+        w2_search_completed = threading.Event()
+        timeline = {}
+        lock = threading.Lock()
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            if start == w1[0]:
+                with lock:
+                    timeline[f"{r['name']}_w1_search"] = systime.monotonic()
+            elif start == w2[0]:
+                w1_download_started.wait(timeout=1.0)
+                with lock:
+                    timeline[f"{r['name']}_w2_search_start"] = systime.monotonic()
+            seg = core.Segment(uri="u1", name=f"{r['name']}_{start.day}", start=start, end=end, size=1000)
+            plan = core.CameraPlan(row=r, key=core.camera_key(r), track_id=101, segments=[seg])
+            if start == w2[0]:
+                with lock:
+                    timeline[f"{r['name']}_w2_search_end"] = systime.monotonic()
+                    if "Cam1_w2_search_end" in timeline and "Cam2_w2_search_end" in timeline:
+                        w2_search_completed.set()
+            return plan
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            if "10" in seg.name:  # W1 segment
+                with lock:
+                    timeline[f"{seg.name}_dl_start"] = systime.monotonic()
+                w1_download_started.set()
+                # Wait until W2 search has finished to prove concurrency
+                w2_search_completed.wait(timeout=1.0)
+                with lock:
+                    timeline[f"{seg.name}_dl_end"] = systime.monotonic()
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_windows(rows, args, [w1, w2])
+
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertTrue(w2_search_completed.is_set())
+        # Assert that W2 search started after W1 download started, and finished before W1 download ended
+        w1_first_dl_start = min(timeline["Cam1_10_dl_start"], timeline["Cam2_10_dl_start"])
+        w1_last_dl_end = max(timeline["Cam1_10_dl_end"], timeline["Cam2_10_dl_end"])
+        self.assertLess(w1_first_dl_start, timeline["Cam1_w2_search_start"])
+        self.assertLess(timeline["Cam1_w2_search_end"], w1_last_dl_end)
+        self.assertLess(timeline["Cam2_w2_search_end"], w1_last_dl_end)
+
+    def test_zero_search_handoff_between_windows(self):
+        """Verifies Window 2 starts with pre-fetched plans without synchronous search delays."""
+        rows = [
+            {"name": "Cam1", "nvr": "192.168.1.10", "channel": "D1"},
+            {"name": "Cam2", "nvr": "192.168.1.20", "channel": "D2"},
+        ]
+        w1 = (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 11, 0, 0))
+        w2 = (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 11, 0, 0))
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        active_window = None
+        searches_during_window = collections.defaultdict(int)
+        lock = threading.Lock()
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            with lock:
+                searches_during_window[active_window] += 1
+            seg = core.Segment(uri="u1", name=f"{r['name']}_{start.day}", start=start, end=end, size=1000)
+            return core.CameraPlan(row=r, key=core.camera_key(r), track_id=101, segments=[seg])
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        orig_run_batch = core.run_batch
+
+        def spy_run_batch(*b_args, **b_kwargs):
+            nonlocal active_window
+            start = b_args[2] if len(b_args) > 2 else b_kwargs.get("start")
+            active_window = start
+            return orig_run_batch(*b_args, **b_kwargs)
+
+        with patch.object(core, "run_batch", side_effect=spy_run_batch):
+            results = core.run_windows(rows, args, [w1, w2])
+
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(r["ok"] for r in results))
+        # During W1's run_batch: W1 cameras searched, plus W2 cameras pre-fetched in background
+        # During W2's run_batch: exactly 0 searches because all plans were pre-fetched!
+        self.assertEqual(searches_during_window[w2[0]], 0)
+
+    def test_window_prefetcher_clean_cancellation(self):
+        """Verifies setting cancel_event halts prefetcher cleanly without thread leaks."""
+        rows = [
+            {"name": f"Cam{i}", "nvr": f"192.168.1.{10+i}", "channel": "D1"}
+            for i in range(4)
+        ]
+        start = datetime(2026, 9, 11, 10, 0, 0)
+        end = datetime(2026, 9, 11, 11, 0, 0)
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+
+        cancel_ev = threading.Event()
+        search_started = threading.Event()
+
+        def hanging_plan_camera(r, client, s, e, mode, cancel_event=None, **kw):
+            search_started.set()
+            while cancel_event and not cancel_event.is_set():
+                systime.sleep(0.01)
+            raise core.Cancelled("cancelled")
+
+        core.plan_camera = hanging_plan_camera
+
+        initial_threads = threading.active_count()
+        clients = {}
+        prefetcher = core.WindowPrefetcher(rows, clients, args, cancel_event=cancel_ev, max_workers=4)
+
+        try:
+            prefetcher.start_prefetch(start, end)
+            self.assertTrue(search_started.wait(timeout=1.0))
+            cancel_ev.set()
+            plans = prefetcher.get_prefetched(timeout=1.0)
+            self.assertIsNotNone(plans)
+            prefetcher.cancel()
+        finally:
+            cancel_ev.set()
+            prefetcher.cancel()
+
+        systime.sleep(0.1)
+        final_threads = threading.active_count()
+        self.assertLessEqual(final_threads, initial_threads + 1)
+
+    def test_multi_window_results_match_expected(self):
+        """Verify results across multiple windows match expected data structures and file paths."""
+        rows = [
+            {"name": "CamA", "nvr": "192.168.1.10", "channel": "D1"},
+            {"name": "CamB", "nvr": "192.168.1.20", "channel": "D2"},
+        ]
+        windows = [
+            (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 11, 0, 0)),
+            (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 11, 0, 0)),
+            (datetime(2026, 9, 12, 10, 0, 0), datetime(2026, 9, 12, 11, 0, 0)),
+        ]
+
+        class DummyArgs:
+            workers = 2
+            per_nvr = 1
+            remux_workers = 2
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+
+        def fake_remux(src, dst, proc_reg, cancel_ev):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(b"mp4data")
+            return True, ""
+
+        core.remux_to_mp4 = fake_remux
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            seg = core.Segment(uri=f"u_{r['name']}_{start.day}", name=f"{r['name']}_{start.day}",
+                               start=start, end=end, size=1000)
+            return core.CameraPlan(row=r, key=core.camera_key(r), track_id=101, segments=[seg])
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_windows(rows, args, windows)
+
+        self.assertEqual(len(results), 6)
+        self.assertTrue(all(r["ok"] for r in results))
+        for r in results:
+            self.assertEqual(len(r["files"]), 1)
+            self.assertTrue(os.path.exists(r["files"][0]))
+            self.assertEqual(r["errors"], [])
+
+    def test_window_prefetcher_reuses_persistent_clients(self):
+        """Verifies persistent NvrClient instances are reused across all windows and prefetcher."""
+        rows = [{"name": "Cam1", "nvr": "192.168.1.10", "channel": "D1"}]
+        windows = [
+            (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 11, 0, 0)),
+            (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 11, 0, 0)),
+        ]
+
+        class DummyArgs:
+            workers = 1
+            per_nvr = 1
+            remux_workers = 1
+            trim = False
+            output_dir = self.test_dir
+            mode = "clip"
+            timeout = 10
+            user = "admin"
+            password = "pwd"
+
+        args = DummyArgs()
+        core.mark_existing = lambda p, args, start, end: None
+        core.remux_to_mp4 = lambda src, dst, proc_reg, cancel_ev: (True, "")
+
+        clients_seen = []
+
+        def fake_plan_camera(r, client, start, end, mode, **kw):
+            clients_seen.append(client)
+            seg = core.Segment(uri="u1", name=f"seg_{start.day}", start=start, end=end, size=1000)
+            return core.CameraPlan(row=r, key=core.camera_key(r), track_id=101, segments=[seg])
+
+        core.plan_camera = fake_plan_camera
+
+        def fake_download(self, seg, dest, **kw):
+            with open(dest, "wb") as f:
+                f.write(b"data")
+
+        core.NvrClient.download = fake_download
+
+        results = core.run_windows(rows, args, windows)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(clients_seen), 2)
+        self.assertIs(clients_seen[0], clients_seen[1])
+
+    def test_window_prefetcher_standalone_methods(self):
+        """Verifies get_prefetched returns None when not started, and handles empty rows."""
+        class DummyArgs:
+            workers = 1
+            user = "admin"
+            password = "pwd"
+            timeout = 10
+
+        args = DummyArgs()
+        prefetcher = core.WindowPrefetcher([], {}, args)
+        self.assertIsNone(prefetcher.get_prefetched())
+        prefetcher.start_prefetch(datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 11, 0, 0))
+        plans = prefetcher.get_prefetched()
+        self.assertEqual(plans, {})
+        prefetcher.cancel()
+
+
+class TestWebGuiPipelinedExecution(unittest.TestCase):
+    def setUp(self):
+        import webgui
+        webgui.CANCEL_EVENT.clear()
+        self.orig_webgui_state = dict(webgui.STATE)
+        self.orig_run_batch = core.run_batch
+        self.orig_prefetcher = core.WindowPrefetcher
+        self.orig_write_log = core.write_run_log
+
+    def tearDown(self):
+        import webgui
+        webgui.CANCEL_EVENT.clear()
+        webgui.STATE.clear()
+        webgui.STATE.update(self.orig_webgui_state)
+        core.run_batch = self.orig_run_batch
+        core.WindowPrefetcher = self.orig_prefetcher
+        core.write_run_log = self.orig_write_log
+
+    def test_plan_run_remux_workers_parsing(self):
+        import webgui
+        payload = {
+            "csv": "camera_n_nvr.csv",
+            "mode": "both",
+            "workers": "4",
+            "per_nvr": "2",
+            "remux_workers": "3",
+            "timeout": "30",
+            "time_mode": "single",
+            "start": "2026-09-10 10:00:00",
+            "end": "2026-09-10 11:00:00",
+            "trim": "false",
+        }
+        plan = webgui.plan_run(payload)
+        self.assertEqual(plan["args"].remux_workers, 3)
+        self.assertEqual(plan["ui"]["remux_workers"], 3)
+
+    def test_webgui_do_run_prefetch_integration(self):
+        import webgui
+        w1 = (datetime(2026, 9, 10, 10, 0, 0), datetime(2026, 9, 10, 22, 0, 0))
+        w2 = (datetime(2026, 9, 11, 10, 0, 0), datetime(2026, 9, 11, 22, 0, 0))
+        plan = {
+            "windows": [w1, w2],
+            "rows": [{"name": "Gate", "nvr": "192.168.1.10", "channel": "D1"}],
+            "args": None,
+        }
+        prefetches_started = []
+
+        class MockPrefetcher:
+            def __init__(self, rows, clients, args, cancel_event=None):
+                self.rows = rows
+                self.clients = clients
+                self.args = args
+                self.cancelled = False
+
+            def start_prefetch(self, start, end):
+                prefetches_started.append((start, end))
+
+            def get_prefetched(self, timeout=None):
+                seg = core.Segment(uri="u1", name="s1", start=w2[0], end=w2[1], size=500)
+                plan_cam = core.CameraPlan(row=plan["rows"][0], key="192.168.1.10/D1", segments=[seg])
+                return {"192.168.1.10/D1": plan_cam}
+
+            def cancel(self):
+                self.cancelled = True
+
+        batches_run = []
+        def mock_run_batch(rows, args, start, end, **kw):
+            batches_run.append((start, end, kw.get("prefetched_plans")))
+            return [{"name": "Gate", "nvr": "192.168.1.10", "channel": "D1", "ok": True, "errors": [], "notes": [], "files": []}]
+
+        core.run_batch = mock_run_batch
+        core.WindowPrefetcher = MockPrefetcher
+        core.write_run_log = lambda r, p: None
+
+        webgui.do_run(plan)
+        self.assertEqual(len(batches_run), 2)
+        self.assertEqual(len(prefetches_started), 1)
+        self.assertEqual(prefetches_started[0], w2)
+        self.assertIsNotNone(batches_run[1][2])
+        self.assertIn("192.168.1.10/D1", batches_run[1][2])
+
+    def test_webgui_cancel_stops_prefetcher(self):
+        import webgui
+        class MockPrefetcher:
+            def __init__(self):
+                self.cancelled = False
+            def cancel(self):
+                self.cancelled = True
+
+        mock_pref = MockPrefetcher()
+        webgui.ACTIVE_PREFETCHER = mock_pref
+        with webgui.LOCK:
+            webgui.STATE["running"] = True
+            webgui.STATE["cancelling"] = False
+
+        ok, err = webgui._cancel()
+        self.assertTrue(ok)
+        self.assertTrue(mock_pref.cancelled)
+        self.assertTrue(webgui.STATE["cancelling"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
 

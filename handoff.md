@@ -342,3 +342,60 @@ OK
 * **ไฟล์:** `cctv_retrieve.py`, `webgui.py`
 * **ปัญหาเดิม:** การ raise ข้อผิดพลาดใหม่ภายใน `except` clause โดยไม่ใช้ `from err` หรือ `from None` ละเมิดกฎ Flake8-Bugbear (B904)
 * **การแก้ไข:** เพิ่ม `from e` ในจุด Exception Chaining ทั้งหมด ส่งผลให้ผ่านการตรวจสอบ `ruff check . --select F,E9,B,W6` ได้อย่างสมบูรณ์แบบ 100% โดยไม่มีข้อผิดพลาดหลงเหลือ
+
+---
+
+## 10. การพัฒนาระบบ Asynchronous Remuxing และ Pipelined Search (Epic 1 & Epic 2)
+
+**วันที่:** 22 กันยายน 2026
+
+### 10.1 ปัญหาเดิมที่พบ
+1. **Bandwidth ดิ่งลงเหลือ 0 ระหว่างการดาวน์โหลด:**
+   * ในระบบเดิม การดาวน์โหลด (`client.download`) และการแปลงไฟล์ (`remux_to_mp4` ด้วย ffmpeg) ทำงานแบบ Synchronous ใน Worker เดียวกัน
+   * เมื่อกล้องดาวน์โหลด 1 segment (~1 GB) เสร็จ Thread จะหยุดดาวน์โหลดและสลับไปรัน ffmpeg remux (1-4 วินาที) ทำให้โควตา Worker Slot และ NVR Slot (`active[host]`) ถูกบล็อกโดยไม่มี Network Traffic
+   * หากตั้งค่า `workers = 1` หรือ Worker ทุกตัวดาวน์โหลดไฟล์เสร็จพร้อมกัน ความเร็วเครือข่ายจะดิ่งลงเหลือ **0 Mbps** ทันที
+2. **Search Barrier ภายใน Batch และระหว่างวัน (Dead-air Gap):**
+   * ใน `run_batch()` เดิม ทุกกล้องต้องรอค้นหา (`plan_camera`) และตรวจสอบไฟล์ซ้ำ (`mark_existing`) ให้เสร็จครบ 100% ก่อน จึงจะเริ่มดาวน์โหลดกล้องแรกได้ (Tail Latency)
+   * ในโหมด Daily Recurring (หลายวัน) เมื่อวันแรกเสร็จ วันถัดไปจะเริ่มค้นหาใหม่ ทุกกล้องจะกลับไปสถานะ `searching` ทำให้ Bandwidth ตกเป็น **0 Mbps นาน 5–15 วินาที** ก่อนจะเริ่มโหลดวันใหม่
+
+### 10.2 การแก้ไขและสถาปัตยกรรมใหม่
+
+#### 1) Epic 1: Asynchronous Decoupled Remuxing & Background Processing
+* **`BackgroundProcessor` (`cctv_retrieve.py`):**
+  * สร้าง Producer-Consumer Queue พร้อมจำกัด Concurrency อิสระ (`DEFAULT_REMUX_WORKERS = 2`, ปรับได้ผ่าน `--remux-workers`)
+  * ป้องกันปัญหา Disk I/O Saturation บน External Storage (`/Volumes/Mac_storage`) โดยแยกงานประมวลผล ffmpeg ออกจาก Network Ingestion
+* **`CameraTaskTracker` (`cctv_retrieve.py`):**
+  * ติดตามสถานะงานเบื้องหลัง รวมผลลัพธ์ `files`, `notes`, `errors` แบบ Thread-safe
+  * เมื่อกล้องดาวน์โหลด segment ครบ ดาวน์โหลด Worker จะคืนโควตา `active[host]` ทันที เพื่อให้กล้องถัดไปในคิวเริ่มดาวน์โหลดได้โดยไม่ต้องรอ remux หรือ snapshot
+* **Offloading `cut_clip` และ `snapshot_via_rtsp`:**
+  * โหมด `--trim`: ส่งงานตัดต่อคลิปขนาดใหญ่เข้า `BackgroundProcessor` ทันทีหลังดาวน์โหลดชิ้นส่วนครบ
+  * โหมด snapshot (`mode == both`): แยกการดึง RTSP frame ออกเป็น Background Task ไม่ขัดจังหวะการรับส่งข้อมูล ISAPI
+
+#### 2) Epic 2: Pipelined Streaming Search & Multi-Window Pre-fetching
+* **Intra-Batch Streaming Pipeline (`run_batch`):**
+  * เปลี่ยนจาก Two-phase barrier เป็น Streaming Pipeline
+  * กล้องตัวใดที่ค้นหาและประเมินไฟล์เสร็จก่อน จะถูกส่งเข้า `pending` และเริ่มดาวน์โหลดทันที ไม่ต้องรอกล้องตัวอื่น
+* **`WindowPrefetcher` (`cctv_retrieve.py`):**
+  * ขณะที่ Window $K$ กำลังดาวน์โหลด ระบบจะส่ง Worker ค้นหาข้อมูลและตรวจสอบไฟล์ของ Window $K+1$ ล่วงหน้าใน Background
+  * เมื่อ Window $K$ ดาวน์โหลดเสร็จ จะส่งมอบ `prefetched_plans` ให้ Window $K+1$ เริ่มดาวน์โหลดต่อได้ทันทีภายในเวลา **< 0.05 วินาที (Zero Search Downtime)**
+* **WebGUI Integration (`webgui.py`):**
+  * เพิ่มตัวเลือกตั้งค่า `Remux Workers` บนหน้าเว็บและ persist ลง `webgui_state.json`
+  * อัปเดต `do_run()` ให้เชื่อมต่อกับ `WindowPrefetcher` โดยสถานะหน้าเว็บจะคงอยู่ที่ `downloading` ต่อเนื่องระหว่างเปลี่ยนวัน
+  * ฟังก์ชัน Cancel (`/api/cancel`) สามารถหยุดทั้ง Active Downloads และ Background Prefetcher ได้ทันที
+
+### 10.3 การแก้ไขปัญหา Unit Test ที่รันนาน / ค้าง (Unit Test Performance Optimization)
+* **สาเหตุเชิงลึก:**
+  * ใน `test_cctv.py` การทดสอบ `test_multi_window_run_log_notes_prefixed` ได้เรียก `webgui.do_run(plan)` ซึ่งมี mock IP เป็น `192.168.1.10`
+  * เมื่อ `do_run()` เปิดใช้งาน `WindowPrefetcher` ตัว Prefetcher ได้ส่ง request ค้นหาไปยัง `192.168.1.10` จริงใน Background Thread
+  * เนื่องจาก IP ดังกล่าวไม่มีอยู่จริง ระบบจึงเข้าสู่ฟังก์ชัน `poll_network_until_connected()` ซึ่งวนลูป retry ทุกๆ 5 วินาทีตลอดไป (เพราะ `cancel_event` ไม่ได้ถูก set)
+  * และ `WindowPrefetcher.get_prefetched(timeout=None)` ได้รอ `self.future.result()` โดยไม่มี timeout ทำให้ Test ค้างไม่สิ้นสุด
+* **แนวทางแก้ไข:**
+  1. เพิ่ม **Bounded Default Timeout (`timeout = 1.0s`)** ใน `WindowPrefetcher.get_prefetched()` เพื่อการันตีว่าจะไม่บล็อกค้างตลอดไป และ fallback ดึงเฉพาะ plan ที่พร้อม
+  2. ปรับปรุง `test_multi_window_run_log_notes_prefixed` ให้ Mock `WindowPrefetcher` ควบคู่กับ `run_batch` เพื่อตัดการเชื่อมต่อเครือข่ายจำลองอย่างสมบูรณ์
+  3. กำหนด `CANCEL_EVENT.clear()` ในช่วงเริ่มต้นของ `do_run()` และใน `setUp()` ของ Test Suite เพื่อป้องกัน State ตกค้าง
+  4. แก้ไข `KeyError: 'downloaded'` ใน `do_run()` โดยใช้ `RUN.get("downloaded", 0)`
+* **ผลลัพธ์การทดสอบ:**
+  * **จำนวนการทดสอบ:** ผ่านครบ **103 จาก 103 Test Cases (100% Pass)**
+  * **เวลาที่ใช้:** ลดลงจากที่ค้างเป็นชั่วโมง เหลือเพียง **3.9 วินาที**
+  * **Linter:** `ruff check .` ผ่านสมบูรณ์แบบ (0 errors, 0 warnings)
+

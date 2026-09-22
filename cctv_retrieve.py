@@ -22,8 +22,10 @@ import collections
 import concurrent.futures
 import csv
 import http.client
+import inspect
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -35,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -49,6 +51,7 @@ RTSP_PORT = 554
 DEFAULT_STREAM_SUFFIX = 1  # main stream sub-index appended to channel number
 DEFAULT_WORKERS = 4        # measured: 4 parallel downloads from different NVRs saturate the ~1 Gbps link
 DEFAULT_PER_NVR = 2        # measured: one NVR tops out around 500 Mbps total
+DEFAULT_REMUX_WORKERS = 2
 DEFAULT_TIMEOUT_S = 30
 DEFAULT_PASSWORDS = ["admin", "Mc158806"]
 AUTH_LOCKOUT_WAIT_S = int(os.environ.get("AUTH_LOCKOUT_WAIT_S", 30 * 60))
@@ -293,6 +296,461 @@ def run_ffmpeg(cmd, timeout, proc_registry=None, cancel_event=None):
     return True, ""
 
 
+# ---------------------------------------------------------------- background processor
+
+
+@dataclass
+class BackgroundTask:
+    task_id: str
+    camera_key: str
+    fn: callable
+    args: tuple = ()
+    kwargs: dict = field(default_factory=dict)
+    on_success: callable = None
+    on_error: callable = None
+    temp_files: list = field(default_factory=list)
+
+
+class BackgroundProcessor:
+    """Concurrency-throttled task queue backed by daemon worker threads."""
+
+    def __init__(self, max_workers=DEFAULT_REMUX_WORKERS, proc_registry=None, cancel_event=None):
+        self.max_workers = max(1, int(max_workers))
+        self.proc_registry = proc_registry
+        self.cancel_event = cancel_event
+        self._queue = queue.Queue()
+        self._condition = threading.Condition()
+        self._active_tasks = 0
+        self._peak_active_tasks = 0
+        self._cancelled = False
+        self._shutdown = False
+        self._workers = []
+
+        for i in range(self.max_workers):
+            t = threading.Thread(
+                target=self._worker_loop,
+                name=f"BackgroundProcessor-Worker-{i + 1}",
+                daemon=True,
+            )
+            t.start()
+            self._workers.append(t)
+
+    @staticmethod
+    def _call_callback(cb, *args):
+        if cb is None:
+            return
+        zero_args = False
+        try:
+            sig = inspect.signature(cb)
+            num_params = len([
+                p for p in sig.parameters.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ])
+            has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
+            if num_params == 0 and not has_varargs:
+                zero_args = True
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            if zero_args:
+                cb()
+            else:
+                cb(*args)
+        except TypeError:
+            try:
+                cb()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cleanup_temp_files(task: BackgroundTask):
+        if not task or not getattr(task, "temp_files", None):
+            return
+        for p in list(task.temp_files):
+            try:
+                if not p:
+                    continue
+                path_str = str(p)
+                if os.path.isdir(path_str):
+                    shutil.rmtree(path_str, ignore_errors=True)
+                elif os.path.exists(path_str) or os.path.islink(path_str):
+                    os.remove(path_str)
+            except OSError:
+                pass
+
+    def submit(self, task: BackgroundTask):
+        """Adds a task to the queue."""
+        if self._shutdown:
+            raise RuntimeError("Cannot submit task to a shut down BackgroundProcessor")
+        with self._condition:
+            if self._cancelled or (self.cancel_event is not None and self.cancel_event.is_set()):
+                self._cleanup_temp_files(task)
+                if task.on_error:
+                    self._call_callback(task.on_error, Cancelled("Processor is cancelled"))
+                return
+            self._queue.put(task)
+            self._condition.notify_all()
+
+    def _worker_loop(self):
+        while True:
+            task = None
+            with self._condition:
+                while not self._shutdown and self._queue.empty():
+                    self._condition.wait(timeout=0.05)
+
+                if self._shutdown:
+                    break
+
+                if not self._queue.empty():
+                    task = self._queue.get_nowait()
+                    self._active_tasks += 1
+                    if self._active_tasks > self._peak_active_tasks:
+                        self._peak_active_tasks = self._active_tasks
+
+            if task is None:
+                continue
+
+            try:
+                if (self.cancel_event is not None and self.cancel_event.is_set()) or self._cancelled:
+                    if not self._cancelled:
+                        self.cancel()
+                    raise Cancelled("Task cancelled before execution")
+
+                res = task.fn(*task.args, **task.kwargs)
+
+                if (self.cancel_event is not None and self.cancel_event.is_set()) or self._cancelled:
+                    if not self._cancelled:
+                        self.cancel()
+                    raise Cancelled("Task cancelled after execution")
+
+                if task.on_success:
+                    self._call_callback(task.on_success, res)
+            except Exception as exc:
+                self._cleanup_temp_files(task)
+                if task.on_error:
+                    self._call_callback(task.on_error, exc)
+            finally:
+                with self._condition:
+                    self._active_tasks -= 1
+                    if self._queue.empty() and self._active_tasks == 0:
+                        self._condition.notify_all()
+
+    def wait_all(self, timeout=None) -> bool:
+        """Blocks until the task queue is empty and all active workers are idle, or cancel_event is set.
+
+        Returns True if queue is empty and active workers are idle without cancellation.
+        Returns False on timeout or if cancelled.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if (self.cancel_event is not None and self.cancel_event.is_set()) or self._cancelled:
+                    if not self._cancelled:
+                        self.cancel()
+                    return False
+
+                if self._queue.empty() and self._active_tasks == 0:
+                    return True
+
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(timeout=min(remaining, 0.05))
+                else:
+                    self._condition.wait(timeout=0.05)
+
+    def cancel(self):
+        """Marks cancelled, flushes queue, kills running procs via proc_registry.kill_all()."""
+        self._cancelled = True
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+
+        with self._condition:
+            while not self._queue.empty():
+                try:
+                    task = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._cleanup_temp_files(task)
+                if task.on_error:
+                    self._call_callback(task.on_error, Cancelled("Task cancelled before execution"))
+            self._condition.notify_all()
+
+        if self.proc_registry is not None:
+            self.proc_registry.kill_all()
+
+    def shutdown(self, wait=True):
+        """Signals workers to terminate and cleans up."""
+        with self._condition:
+            self._shutdown = True
+            while not self._queue.empty():
+                try:
+                    task = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._cleanup_temp_files(task)
+            self._condition.notify_all()
+
+        if wait:
+            for worker in list(self._workers):
+                if worker.is_alive() and worker != threading.current_thread():
+                    worker.join(timeout=2.0)
+
+    @property
+    def active_tasks(self) -> int:
+        with self._condition:
+            return self._active_tasks
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled or (self.cancel_event is not None and self.cancel_event.is_set())
+
+    @property
+    def is_shutdown(self) -> bool:
+        return self._shutdown
+
+
+class CameraTaskTracker:
+    """Tracks background tasks per camera (key), aggregates results (files, notes, errors),
+    emits stage callbacks ('remuxing' while background work is active, and 'ok'/'fail' only
+    when all downloads and background tasks complete), and manages work_dir cleanup.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cameras = {}
+
+    def register_camera(self, key, row=None, work_dir=None, callbacks=None, result=None, is_trim=False):
+        with self._lock:
+            if key not in self._cameras:
+                if result is None:
+                    res = {
+                        "name": row.get("name") if row else None,
+                        "nvr": row["nvr"].strip() if row and "nvr" in row else "",
+                        "channel": row["channel"].strip() if row and "channel" in row else "",
+                        "ok": True,
+                        "errors": [],
+                        "notes": [],
+                        "files": [],
+                    }
+                else:
+                    res = dict(result)
+                    res["files"] = list(result.get("files", []))
+                    res["notes"] = list(result.get("notes", []))
+                    res["errors"] = list(result.get("errors", []))
+
+                self._cameras[key] = {
+                    "key": key,
+                    "row": row or {},
+                    "work_dir": work_dir,
+                    "callbacks": callbacks,
+                    "result": res,
+                    "pending_tasks": 0,
+                    "download_finished": False,
+                    "finalized": False,
+                    "is_trim": is_trim,
+                }
+            else:
+                cam = self._cameras[key]
+                if row:
+                    cam["row"] = row
+                if work_dir:
+                    cam["work_dir"] = work_dir
+                if callbacks:
+                    cam["callbacks"] = callbacks
+                if is_trim:
+                    cam["is_trim"] = is_trim
+                if result:
+                    self._merge_result_locked(cam["result"], result)
+
+    def task_submitted(self, key, task_id=None):
+        with self._lock:
+            cam = self._cameras.get(key)
+            if cam:
+                cam["pending_tasks"] += 1
+
+    def task_completed(self, key, task_id=None, file=None, files=None, notes=None):
+        to_emit = None
+        to_cleanup = None
+        with self._lock:
+            cam = self._cameras.get(key)
+            if not cam:
+                return
+            if file and file not in cam["result"]["files"]:
+                cam["result"]["files"].append(file)
+            if files:
+                for f in files:
+                    if f and f not in cam["result"]["files"]:
+                        cam["result"]["files"].append(f)
+            if notes:
+                for n in notes:
+                    if n not in cam["result"]["notes"]:
+                        cam["result"]["notes"].append(n)
+            cam["pending_tasks"] = max(0, cam["pending_tasks"] - 1)
+            if cam["download_finished"] and cam["pending_tasks"] == 0:
+                to_emit, to_cleanup = self._finalize_locked(key)
+
+        if to_cleanup and os.path.exists(to_cleanup):
+            try:
+                shutil.rmtree(to_cleanup, ignore_errors=True)
+            except OSError:
+                pass
+        if to_emit:
+            cb, k, stage, row, errs, nts, fls = to_emit
+            cb.stage(k, stage, row, errors=errs, notes=nts, files=fls)
+
+    def task_failed(self, key, task_id=None, error=None):
+        to_emit = None
+        to_cleanup = None
+        with self._lock:
+            cam = self._cameras.get(key)
+            if not cam:
+                return
+            cam["result"]["ok"] = False
+            if error:
+                cam["result"]["errors"].append(str(error))
+            cam["pending_tasks"] = max(0, cam["pending_tasks"] - 1)
+            if cam["download_finished"] and cam["pending_tasks"] == 0:
+                to_emit, to_cleanup = self._finalize_locked(key)
+
+        if to_cleanup and os.path.exists(to_cleanup):
+            try:
+                shutil.rmtree(to_cleanup, ignore_errors=True)
+            except OSError:
+                pass
+        if to_emit:
+            cb, k, stage, row, errs, nts, fls = to_emit
+            cb.stage(k, stage, row, errors=errs, notes=nts, files=fls)
+
+    def complete_download(self, key, result=None):
+        to_emit = None
+        to_cleanup = None
+        with self._lock:
+            cam = self._cameras.get(key)
+            if not cam:
+                return
+            if result:
+                self._merge_result_locked(cam["result"], result)
+            cam["download_finished"] = True
+
+            if cam["pending_tasks"] > 0:
+                cb = cam.get("callbacks")
+                if cb and cam["result"]["ok"]:
+                    res = cam["result"]
+                    to_emit = (
+                        cb,
+                        key,
+                        "cutting" if cam.get("is_trim") else "remuxing",
+                        cam["row"],
+                        list(res["errors"]),
+                        list(res["notes"]),
+                        list(res["files"]),
+                    )
+            else:
+                to_emit, to_cleanup = self._finalize_locked(key)
+
+        if to_cleanup and os.path.exists(to_cleanup):
+            try:
+                shutil.rmtree(to_cleanup, ignore_errors=True)
+            except OSError:
+                pass
+        if to_emit:
+            cb, k, stage, row, errs, nts, fls = to_emit
+            cb.stage(k, stage, row, errors=errs, notes=nts, files=fls)
+
+    def _merge_result_locked(self, target, source):
+        for f in source.get("files", []):
+            if f not in target["files"]:
+                target["files"].append(f)
+        for n in source.get("notes", []):
+            if n not in target["notes"]:
+                target["notes"].append(n)
+        for e in source.get("errors", []):
+            if e not in target["errors"]:
+                target["errors"].append(e)
+        if not source.get("ok", True):
+            target["ok"] = False
+
+    def _finalize_locked(self, key):
+        cam = self._cameras.get(key)
+        if not cam or cam["finalized"]:
+            return None, None
+        cam["finalized"] = True
+        work_dir = cam.get("work_dir")
+        cb = cam.get("callbacks")
+        to_emit = None
+        if cb:
+            res = cam["result"]
+            if "cancelled" in res["errors"]:
+                stage = "cancelled"
+            elif res["ok"] and not res["errors"]:
+                stage = "ok"
+            else:
+                stage = "fail"
+            to_emit = (
+                cb,
+                key,
+                stage,
+                cam["row"],
+                list(res["errors"]),
+                list(res["notes"]),
+                list(res["files"]),
+            )
+        return to_emit, work_dir
+
+    def has_camera(self, key):
+        with self._lock:
+            return key in self._cameras
+
+    def has_pending_tasks(self, key):
+        with self._lock:
+            cam = self._cameras.get(key)
+            if not cam:
+                return False
+            return cam["pending_tasks"] > 0 or not cam["download_finished"]
+
+    def is_finalized(self, key):
+        with self._lock:
+            cam = self._cameras.get(key)
+            return cam["finalized"] if cam else False
+
+    def get_result(self, key):
+        with self._lock:
+            cam = self._cameras.get(key)
+            if not cam:
+                return None
+            res = dict(cam["result"])
+            res["files"] = list(res["files"])
+            res["notes"] = list(res["notes"])
+            res["errors"] = list(res["errors"])
+            return res
+
+    def get_all_results(self):
+        with self._lock:
+            results = []
+            for cam in self._cameras.values():
+                res = dict(cam["result"])
+                res["files"] = list(res["files"])
+                res["notes"] = list(res["notes"])
+                res["errors"] = list(res["errors"])
+                results.append(res)
+            return results
+
+    def cleanup(self):
+        with self._lock:
+            for cam in self._cameras.values():
+                work_dir = cam.get("work_dir")
+                if work_dir and os.path.exists(work_dir):
+                    try:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                    except OSError:
+                        pass
+
+
 # ---------------------------------------------------------------- ISAPI client
 
 @dataclass
@@ -382,8 +840,6 @@ class NvrClient:
             if not candidates:
                 raise IsapiError(f"NVR {self.host} has no password configured")
 
-            last_401 = None
-
             for candidate in candidates:
                 while True:
                     check_cancel(cancel_event)
@@ -400,10 +856,9 @@ class NvrClient:
                         return resp
                     except urllib.error.HTTPError as e:
                         if e.code == 401:
-                            last_401 = e
                             break
                         raise IsapiError(f"NVR {self.host} {path} returned HTTP {e.code}") from e
-                    except (urllib.error.URLError, OSError, TimeoutError) as e:
+                    except (urllib.error.URLError, OSError, TimeoutError):
                         check_cancel(cancel_event)
                         self.poll_network_until_connected(cancel_event=cancel_event, on_status=on_status, poll_interval=5)
                         continue
@@ -880,7 +1335,8 @@ def snapshot_via_rtsp(host, track_id, start, user, password, out_path, timeout_s
                       timeout_s + 30, proc_registry, cancel_event)
 
 
-def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_registry, cancel_event):
+def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_registry, cancel_event,
+                   bg_processor=None, camera_tracker=None):
     row = plan.row
     result = {"name": row.get("name"), "nvr": row["nvr"].strip(), "channel": row["channel"].strip(),
               "ok": True, "errors": [], "notes": [], "files": []}
@@ -896,7 +1352,16 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
         report(stage, notes=[msg])
         print(f"  {row.get('name')} [{plan.key}] {msg}", file=sys.stderr, flush=True)
 
+    if bg_processor is not None and camera_tracker is None:
+        camera_tracker = CameraTaskTracker()
+
     work_dir = os.path.join(run_dir, safe_name(plan.key))
+    if camera_tracker is not None:
+        camera_tracker.register_camera(
+            plan.key, plan.row, work_dir=work_dir, callbacks=callbacks, result=result,
+            is_trim=getattr(args, "trim", False),
+        )
+
     try:
         check_cancel(cancel_event)
         base = output_base(row, start, args.output_dir)
@@ -906,7 +1371,10 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             if file_done(base + ".jpg"):
                 result["files"].append(base + ".jpg")
                 result["notes"].append("snapshot already in output folder, skipped")
-                report("ok")
+                if camera_tracker is not None:
+                    camera_tracker.complete_download(plan.key, result=result)
+                else:
+                    report("ok")
                 return result
             report("snapshot")
             active_pass = getattr(client, "active_password", args.password)
@@ -917,7 +1385,10 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             else:
                 result["ok"] = False
                 result["errors"].append(f"snapshot: {err}")
-            report("ok" if result["ok"] else "fail")
+            if camera_tracker is not None:
+                camera_tracker.complete_download(plan.key, result=result)
+            else:
+                report("ok" if result["ok"] else "fail")
             return result
 
         # Both modes use work_dir as scratch for downloading temp segments.
@@ -941,17 +1412,53 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             result["notes"].append("clip already in output folder (MP4), skipped")
         elif plan.legacy_clip:
             result["notes"].append("clip detected as legacy non-MP4 (converting in-place)")
-            report("remuxing")
-            ok, err = repair_legacy_file(base + ".mp4", proc_registry, cancel_event)
-            if ok:
-                result["notes"].append(f"converted legacy clip to MP4: {os.path.basename(base + '.mp4')}")
+            if bg_processor is not None:
+                task_id = f"repair_clip_{plan.key}"
+                if camera_tracker is not None:
+                    camera_tracker.task_submitted(plan.key, task_id)
+
+                def _make_clip_repair_callbacks(p_key, t_id, dest):
+                    def _on_success(res):
+                        ok, err = (res[0], res[1]) if (isinstance(res, tuple) and len(res) == 2) else (True, "")
+                        if not ok:
+                            if camera_tracker is not None:
+                                camera_tracker.task_failed(p_key, t_id, error=f"failed to convert legacy clip: {err}")
+                        else:
+                            if camera_tracker is not None:
+                                camera_tracker.task_completed(
+                                    p_key, t_id, file=dest,
+                                    notes=[f"converted legacy clip to MP4: {os.path.basename(dest)}"],
+                                )
+
+                    def _on_error(exc):
+                        if camera_tracker is not None:
+                            camera_tracker.task_failed(p_key, t_id, error=f"failed to convert legacy clip: {exc}")
+
+                    return _on_success, _on_error
+
+                on_success_cb, on_error_cb = _make_clip_repair_callbacks(plan.key, task_id, base + ".mp4")
+                task = BackgroundTask(
+                    task_id=task_id,
+                    camera_key=plan.key,
+                    fn=repair_legacy_file,
+                    args=(base + ".mp4", proc_registry, cancel_event),
+                    on_success=on_success_cb,
+                    on_error=on_error_cb,
+                )
+                bg_processor.submit(task)
                 plan.clip_exists = True
             else:
-                result["notes"].append(f"failed to convert legacy clip ({err}), regenerating clip")
-                try:
-                    os.remove(base + ".mp4")
-                except OSError:
-                    pass
+                report("remuxing")
+                ok, err = repair_legacy_file(base + ".mp4", proc_registry, cancel_event)
+                if ok:
+                    result["notes"].append(f"converted legacy clip to MP4: {os.path.basename(base + '.mp4')}")
+                    plan.clip_exists = True
+                else:
+                    result["notes"].append(f"failed to convert legacy clip ({err}), regenerating clip")
+                    try:
+                        os.remove(base + ".mp4")
+                    except OSError:
+                        pass
 
         seg_paths, lengths = {}, {s.name: s.size for s in plan.segments if s.name not in existing and s.name not in legacy}
         for seg in [] if plan.clip_exists else plan.segments:
@@ -967,34 +1474,108 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
                 continue
 
             if not args.trim and seg.name in legacy:
-                report("remuxing")
-                ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
-                if ok:
-                    if dest_final not in result["files"]:
-                        result["files"].append(dest_final)
-                    result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                if bg_processor is not None:
+                    task_id = f"repair_seg_{plan.key}_{safe_name(seg.name)}"
+                    if camera_tracker is not None:
+                        camera_tracker.task_submitted(plan.key, task_id)
+
+                    def _make_seg_repair_callbacks(p_key, t_id, dest):
+                        def _on_success(res):
+                            ok, err = (res[0], res[1]) if (isinstance(res, tuple) and len(res) == 2) else (True, "")
+                            if not ok:
+                                if camera_tracker is not None:
+                                    camera_tracker.task_failed(p_key, t_id, error=f"repair legacy file failed: {err}")
+                            else:
+                                if camera_tracker is not None:
+                                    camera_tracker.task_completed(
+                                        p_key, t_id, file=dest,
+                                        notes=[f"converted legacy file to MP4: {os.path.basename(dest)}"],
+                                    )
+
+                        def _on_error(exc):
+                            if camera_tracker is not None:
+                                camera_tracker.task_failed(p_key, t_id, error=f"repair legacy file failed: {exc}")
+
+                        return _on_success, _on_error
+
+                    on_success_cb, on_error_cb = _make_seg_repair_callbacks(plan.key, task_id, dest_final)
+                    task = BackgroundTask(
+                        task_id=task_id,
+                        camera_key=plan.key,
+                        fn=repair_legacy_file,
+                        args=(dest_final, proc_registry, cancel_event),
+                        on_success=on_success_cb,
+                        on_error=on_error_cb,
+                    )
+                    bg_processor.submit(task)
                     seg_paths[seg.name] = dest_final
                     continue
                 else:
-                    result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
-                    try:
-                        os.remove(dest_final)
-                    except OSError:
-                        pass
-                    lengths[seg.name] = seg.size
+                    report("remuxing")
+                    ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
+                    if ok:
+                        if dest_final not in result["files"]:
+                            result["files"].append(dest_final)
+                        result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                        seg_paths[seg.name] = dest_final
+                        continue
+                    else:
+                        result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
+                        try:
+                            os.remove(dest_final)
+                        except OSError:
+                            pass
+                        lengths[seg.name] = seg.size
 
             if args.trim and file_done(dest_final):
                 if is_real_mp4(dest_final):
                     seg_paths[seg.name] = dest_final
                     continue
                 if seg.name in legacy:
-                    report("remuxing")
-                    ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
-                    if ok:
-                        result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                    if bg_processor is not None:
+                        task_id = f"repair_trim_seg_{plan.key}_{safe_name(seg.name)}"
+                        if camera_tracker is not None:
+                            camera_tracker.task_submitted(plan.key, task_id)
+
+                        def _make_trim_seg_repair_callbacks(p_key, t_id, dest):
+                            def _on_success(res):
+                                ok, err = (res[0], res[1]) if (isinstance(res, tuple) and len(res) == 2) else (True, "")
+                                if not ok:
+                                    if camera_tracker is not None:
+                                        camera_tracker.task_failed(p_key, t_id, error=f"repair legacy file failed: {err}")
+                                else:
+                                    if camera_tracker is not None:
+                                        camera_tracker.task_completed(
+                                            p_key, t_id,
+                                            notes=[f"converted legacy file to MP4: {os.path.basename(dest)}"],
+                                        )
+
+                            def _on_error(exc):
+                                if camera_tracker is not None:
+                                    camera_tracker.task_failed(p_key, t_id, error=f"repair legacy file failed: {exc}")
+
+                            return _on_success, _on_error
+
+                        on_success_cb, on_error_cb = _make_trim_seg_repair_callbacks(plan.key, task_id, dest_final)
+                        task = BackgroundTask(
+                            task_id=task_id,
+                            camera_key=plan.key,
+                            fn=repair_legacy_file,
+                            args=(dest_final, proc_registry, cancel_event),
+                            on_success=on_success_cb,
+                            on_error=on_error_cb,
+                        )
+                        bg_processor.submit(task)
                         seg_paths[seg.name] = dest_final
                         continue
-                    result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
+                    else:
+                        report("remuxing")
+                        ok, err = repair_legacy_file(dest_final, proc_registry, cancel_event)
+                        if ok:
+                            result["notes"].append(f"converted legacy file to MP4: {os.path.basename(dest_final)}")
+                            seg_paths[seg.name] = dest_final
+                            continue
+                        result["notes"].append(f"repair legacy file failed ({err}), re-downloading: {os.path.basename(dest_final)}")
                 else:
                     result["notes"].append(f"corrupted segment found ({os.path.basename(dest_final)}), re-downloading")
                 try:
@@ -1019,6 +1600,48 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
 
             if args.trim:
                 seg_paths[seg.name] = temp_ps
+            elif bg_processor is not None:
+                task_id = f"remux_{plan.key}_{safe_name(seg.name)}"
+                if camera_tracker is not None:
+                    camera_tracker.task_submitted(plan.key, task_id)
+
+                def _make_callbacks(p_key, t_id, dest, ps):
+                    def _on_success(res):
+                        ok, err = (res[0], res[1]) if (isinstance(res, tuple) and len(res) == 2) else (True, "")
+                        if not ok:
+                            if camera_tracker is not None:
+                                camera_tracker.task_failed(p_key, t_id, error=f"remux: {err}")
+                        else:
+                            if camera_tracker is not None:
+                                camera_tracker.task_completed(p_key, t_id, file=dest)
+                        try:
+                            if os.path.exists(ps):
+                                os.remove(ps)
+                        except OSError:
+                            pass
+
+                    def _on_error(exc):
+                        if camera_tracker is not None:
+                            camera_tracker.task_failed(p_key, t_id, error=f"remux: {exc}")
+                        try:
+                            if os.path.exists(ps):
+                                os.remove(ps)
+                        except OSError:
+                            pass
+
+                    return _on_success, _on_error
+
+                on_success_cb, on_error_cb = _make_callbacks(plan.key, task_id, dest_final, temp_ps)
+                task = BackgroundTask(
+                    task_id=task_id,
+                    camera_key=plan.key,
+                    fn=remux_to_mp4,
+                    args=(temp_ps, dest_final, proc_registry, cancel_event),
+                    on_success=on_success_cb,
+                    on_error=on_error_cb,
+                    temp_files=[temp_ps],
+                )
+                bg_processor.submit(task)
             else:
                 report("remuxing")
                 ok, err = remux_to_mp4(temp_ps, dest_final, proc_registry, cancel_event)
@@ -1040,58 +1663,268 @@ def process_camera(plan, args, start, end, client, run_dir, callbacks, proc_regi
             result["notes"].append(f"recording covers {covered:.0f}s of {wanted:.0f}s requested (gaps on NVR)")
 
         if plan.clip_exists:
-            if (base + ".mp4") not in result["files"]:
-                result["files"].append(base + ".mp4")
-        elif args.trim:
-            parts = trim_parts(plan, start, end, seg_paths)
-            report("cutting")
-            ok, err = cut_clip(parts, base + ".mp4", proc_registry, cancel_event, work_dir)
-            if ok:
+            if not (plan.legacy_clip and bg_processor is not None):
                 if (base + ".mp4") not in result["files"]:
                     result["files"].append(base + ".mp4")
-            else:
-                result["ok"] = False
-                result["errors"].append(f"clip: {err}")
+        elif args.trim:
+            parts = trim_parts(plan, start, end, seg_paths)
+            if bg_processor is not None:
+                task_id = f"cut_{plan.key}"
+                if camera_tracker is not None:
+                    camera_tracker.task_submitted(plan.key, task_id)
 
-        if args.mode == "both" and result["ok"] and file_done(base + ".jpg"):
-            result["files"].append(base + ".jpg")
-        elif args.mode == "both" and result["ok"]:
-            report("snapshot")
-            if args.trim:
-                ok, err = snapshot_from_clip(base + ".mp4", base + ".jpg", proc_registry, cancel_event)
+                def _run_cut_task():
+                    if callbacks:
+                        try:
+                            callbacks.stage(plan.key, "cutting", plan.row)
+                        except TypeError:
+                            try:
+                                callbacks.stage(plan.key, "cutting")
+                            except Exception:
+                                pass
+                    try:
+                        ok, err = cut_clip(parts, base + ".mp4", proc_registry, cancel_event, work_dir)
+                        if not ok:
+                            return False, err
+                        snapshot_file = None
+                        snapshot_err = None
+                        if getattr(args, "mode", "clip") == "both":
+                            if not file_done(base + ".jpg"):
+                                if callbacks:
+                                    try:
+                                        callbacks.stage(plan.key, "snapshot", plan.row)
+                                    except TypeError:
+                                        try:
+                                            callbacks.stage(plan.key, "snapshot")
+                                        except Exception:
+                                            pass
+                                try:
+                                    s_ok, s_err = snapshot_from_clip(base + ".mp4", base + ".jpg", proc_registry, cancel_event)
+                                    if s_ok:
+                                        snapshot_file = base + ".jpg"
+                                    else:
+                                        snapshot_err = f"snapshot failed (clip saved): {redact(s_err)[:200]}"
+                                except Exception as exc:
+                                    if (cancel_event is not None and cancel_event.is_set()) or isinstance(exc, Cancelled):
+                                        raise
+                                    snapshot_err = f"snapshot failed (clip saved): {redact(str(exc))[:200]}"
+                            else:
+                                snapshot_file = base + ".jpg"
+                        return True, (snapshot_file, snapshot_err)
+                    finally:
+                        if os.path.exists(work_dir):
+                            try:
+                                shutil.rmtree(work_dir, ignore_errors=True)
+                            except OSError:
+                                pass
+
+                def _make_cut_callbacks(p_key, t_id, out_clip):
+                    def _on_success(res):
+                        ok = res[0] if isinstance(res, tuple) else res
+                        if not ok:
+                            err_msg = res[1] if isinstance(res, tuple) and len(res) > 1 else "cut failed"
+                            if camera_tracker is not None:
+                                camera_tracker.task_failed(p_key, t_id, error=f"clip: {err_msg}")
+                        else:
+                            files = [out_clip]
+                            notes = []
+                            if isinstance(res, tuple) and len(res) > 1 and isinstance(res[1], tuple):
+                                snap_file, snap_err = res[1]
+                                if snap_file:
+                                    files.append(snap_file)
+                                if snap_err:
+                                    notes.append(snap_err)
+                            if camera_tracker is not None:
+                                camera_tracker.task_completed(p_key, t_id, files=files, notes=notes)
+
+                    def _on_error(exc):
+                        if camera_tracker is not None:
+                            camera_tracker.task_failed(p_key, t_id, error=f"clip: {exc}")
+
+                    return _on_success, _on_error
+
+                on_success_cb, on_error_cb = _make_cut_callbacks(plan.key, task_id, base + ".mp4")
+                task = BackgroundTask(
+                    task_id=task_id,
+                    camera_key=plan.key,
+                    fn=_run_cut_task,
+                    on_success=on_success_cb,
+                    on_error=on_error_cb,
+                    temp_files=[work_dir],
+                )
+                bg_processor.submit(task)
             else:
-                # Raw segments start long before the window; RTSP playback gives an exact frame quickly.
+                report("cutting")
+                ok, err = cut_clip(parts, base + ".mp4", proc_registry, cancel_event, work_dir)
+                if ok:
+                    if (base + ".mp4") not in result["files"]:
+                        result["files"].append(base + ".mp4")
+                else:
+                    result["ok"] = False
+                    result["errors"].append(f"clip: {err}")
+
+        if args.mode == "both" and result["ok"]:
+            if file_done(base + ".jpg"):
+                if (base + ".jpg") not in result["files"]:
+                    result["files"].append(base + ".jpg")
+            elif args.trim and not plan.clip_exists and bg_processor is not None:
+                pass
+            elif args.trim and plan.clip_exists and bg_processor is not None:
+                task_id = f"snapshot_clip_{plan.key}"
+                if camera_tracker is not None:
+                    camera_tracker.task_submitted(plan.key, task_id)
+
+                out_jpg = base + ".jpg"
+                clip_mp4 = base + ".mp4"
+
+                def _run_clip_snapshot():
+                    if camera_tracker is not None:
+                        curr = camera_tracker.get_result(plan.key)
+                        if curr:
+                            cb.stage(plan.key, "snapshot", row,
+                                     errors=list(curr["errors"]),
+                                     notes=list(curr["notes"]),
+                                     files=list(curr["files"]))
+                        else:
+                            report("snapshot")
+                    else:
+                        report("snapshot")
+                    return snapshot_from_clip(clip_mp4, out_jpg, proc_registry, cancel_event)
+
+                def _on_clip_snap_success(res):
+                    ok, err = (res[0], res[1]) if isinstance(res, tuple) and len(res) == 2 else (True, "")
+                    if ok:
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, file=out_jpg)
+                    else:
+                        warn_note = f"snapshot failed (clip saved): {redact(err)[:200]}"
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, notes=[warn_note])
+
+                def _on_clip_snap_error(exc):
+                    if (cancel_event is not None and cancel_event.is_set()) or isinstance(exc, Cancelled):
+                        if camera_tracker is not None:
+                            camera_tracker.task_failed(plan.key, task_id, error="cancelled")
+                    else:
+                        warn_note = f"snapshot failed (clip saved): {redact(str(exc))[:200]}"
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, notes=[warn_note])
+
+                task = BackgroundTask(
+                    task_id=task_id,
+                    camera_key=plan.key,
+                    fn=_run_clip_snapshot,
+                    on_success=_on_clip_snap_success,
+                    on_error=_on_clip_snap_error,
+                )
+                bg_processor.submit(task)
+            elif not args.trim and bg_processor is not None:
+                task_id = f"snapshot_{plan.key}"
+                if camera_tracker is not None:
+                    camera_tracker.task_submitted(plan.key, task_id)
+
                 active_pass = getattr(client, "active_password", args.password)
-                ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, active_pass,
-                                            base + ".jpg", args.timeout, proc_registry, cancel_event)
-            if ok:
-                result["files"].append(base + ".jpg")
+                host = client.host
+                track_id = plan.track_id
+                user = args.user
+                out_jpg = base + ".jpg"
+                timeout = args.timeout
+
+                def _run_rtsp_snapshot():
+                    if camera_tracker is not None:
+                        curr = camera_tracker.get_result(plan.key)
+                        if curr:
+                            cb.stage(plan.key, "snapshot", row,
+                                     errors=list(curr["errors"]),
+                                     notes=list(curr["notes"]),
+                                     files=list(curr["files"]))
+                        else:
+                            report("snapshot")
+                    else:
+                        report("snapshot")
+                    ok, err = snapshot_via_rtsp(
+                        host, track_id, start, user, active_pass,
+                        out_jpg, timeout, proc_registry, cancel_event,
+                    )
+                    return ok, err
+
+                def _on_rtsp_success(res):
+                    ok, err = (res[0], res[1]) if isinstance(res, tuple) and len(res) == 2 else (True, "")
+                    if ok:
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, file=out_jpg)
+                    else:
+                        warn_note = f"snapshot failed (clip saved): {redact(err)[:200]}"
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, notes=[warn_note])
+
+                def _on_rtsp_error(exc):
+                    if (cancel_event is not None and cancel_event.is_set()) or isinstance(exc, Cancelled):
+                        if camera_tracker is not None:
+                            camera_tracker.task_failed(plan.key, task_id, error="cancelled")
+                    else:
+                        warn_note = f"snapshot failed (clip saved): {redact(str(exc))[:200]}"
+                        if camera_tracker is not None:
+                            camera_tracker.task_completed(plan.key, task_id, notes=[warn_note])
+
+                task = BackgroundTask(
+                    task_id=task_id,
+                    camera_key=plan.key,
+                    fn=_run_rtsp_snapshot,
+                    on_success=_on_rtsp_success,
+                    on_error=_on_rtsp_error,
+                )
+                bg_processor.submit(task)
             else:
-                # Snapshot failure is a warning in 'both' mode — the clip was already saved successfully.
-                result["notes"].append(f"snapshot failed (clip saved): {redact(err)[:200]}")
+                report("snapshot")
+                if args.trim:
+                    ok, err = snapshot_from_clip(base + ".mp4", base + ".jpg", proc_registry, cancel_event)
+                else:
+                    # Raw segments start long before the window; RTSP playback gives an exact frame quickly.
+                    active_pass = getattr(client, "active_password", args.password)
+                    ok, err = snapshot_via_rtsp(client.host, plan.track_id, start, args.user, active_pass,
+                                                base + ".jpg", args.timeout, proc_registry, cancel_event)
+                if ok:
+                    if (base + ".jpg") not in result["files"]:
+                        result["files"].append(base + ".jpg")
+                else:
+                    # Snapshot failure is a warning in 'both' mode — the clip was already saved successfully.
+                    result["notes"].append(f"snapshot failed (clip saved): {redact(err)[:200]}")
+
+        if camera_tracker is not None:
+            camera_tracker.complete_download(plan.key, result=result)
     except Cancelled:
         result["ok"] = False
         result["errors"].append("cancelled")
-        report("cancelled")
+        if camera_tracker is not None:
+            camera_tracker.complete_download(plan.key, result=result)
+        else:
+            report("cancelled")
         return result
     except IsapiError as e:
         result["ok"] = False
         result["errors"].append(str(e))
+        if camera_tracker is not None:
+            camera_tracker.complete_download(plan.key, result=result)
     except Exception as e:
         # One camera's unexpected error must not abort the batch or its run log.
         result["ok"] = False
         result["errors"].append(f"internal error: {redact(str(e))}")
+        if camera_tracker is not None:
+            camera_tracker.complete_download(plan.key, result=result)
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if camera_tracker is None or not camera_tracker.has_pending_tasks(plan.key):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-    report("ok" if result["ok"] else "fail")
+    if camera_tracker is None:
+        report("ok" if result["ok"] else "fail")
     return result
 
 
 class Callbacks:
     """Progress hooks; the CLI uses these no-op defaults, the web GUI overrides them."""
 
-    def stage(self, key, stage, row, **info):
+    def stage(self, key, stage, row=None, **info):
         pass
 
     def bytes(self, key, n):
@@ -1118,81 +1951,419 @@ def prepare_segments_dir(output_dir):
     return run_dir
 
 
-def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_registry=None):
+def _search_and_mark_camera(row, client, start, end, args, callbacks, cancel_event):
+    """Search recordings for one camera and mark existing files; returns CameraPlan."""
+    try:
+        plan = plan_camera(row, client, start, end, args.mode, cancel_event=cancel_event, callbacks=callbacks)
+        mark_existing(plan, args, start, end)
+        return plan
+    except Cancelled:
+        plan = CameraPlan(row=row, key=camera_key(row))
+        plan.error = "cancelled"
+        return plan
+    except Exception as e:
+        plan = CameraPlan(row=row, key=camera_key(row))
+        plan.error = f"search: {e}"
+        return plan
+
+
+def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_registry=None,
+              bg_processor=None, camera_tracker=None, prefetched_plans=None, clients=None):
     """Search every camera's recordings, then download and trim with at most `args.workers` downloads
     overall and `args.per_nvr` per NVR. Shared by the CLI and the web GUI."""
+    if not rows:
+        return []
+
     callbacks = callbacks or Callbacks()
     proc_registry = proc_registry or ProcRegistry()
-    clients = {}
+
+    own_bg = False
+    if bg_processor is None:
+        remux_workers = getattr(args, "remux_workers", DEFAULT_REMUX_WORKERS) or DEFAULT_REMUX_WORKERS
+        bg_processor = BackgroundProcessor(
+            max_workers=remux_workers,
+            proc_registry=proc_registry,
+            cancel_event=cancel_event,
+        )
+        own_bg = True
+
+    if camera_tracker is None:
+        camera_tracker = CameraTaskTracker()
+
+    if clients is None:
+        clients = {}
     for row in rows:
         host = row["nvr"].strip()
         clients.setdefault(host, NvrClient(host, args.user, args.password, args.timeout))
 
-    for row in rows:
-        callbacks.stage(camera_key(row), "searching", row)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        plans = list(pool.map(lambda r: plan_camera(r, clients[r["nvr"].strip()], start, end, args.mode,
-                                                    cancel_event=cancel_event, callbacks=callbacks), rows))
-        list(pool.map(lambda p: mark_existing(p, args, start, end), plans))
+    if prefetched_plans:
+        if isinstance(prefetched_plans, dict):
+            prefetch_map = prefetched_plans
+        elif isinstance(prefetched_plans, list):
+            prefetch_map = {p.key: p for p in prefetched_plans}
+        else:
+            prefetch_map = dict(prefetched_plans)
+    else:
+        prefetch_map = {}
 
     results = []
     pending = []
-    for plan in plans:
-        if plan.error:
-            results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
-                            "channel": plan.row["channel"].strip(), "ok": False,
-                            "errors": [plan.error], "notes": [], "files": []})
-            callbacks.stage(plan.key, "cancelled" if plan.error == "cancelled" else "fail",
-                            plan.row, errors=[plan.error], notes=[], files=[])
+    search_rows = []
+
+    for row in rows:
+        key = camera_key(row)
+        if key in prefetch_map:
+            plan = prefetch_map[key]
+            if plan.error:
+                results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
+                                "channel": plan.row["channel"].strip(), "ok": False,
+                                "errors": [plan.error], "notes": [], "files": []})
+                callbacks.stage(plan.key, "cancelled" if plan.error == "cancelled" else "fail",
+                                plan.row, errors=[plan.error], notes=[], files=[])
+            else:
+                callbacks.stage(plan.key, "queued", plan.row, expected_bytes=plan.expected_bytes)
+                pending.append(plan)
         else:
-            callbacks.stage(plan.key, "queued", plan.row, expected_bytes=plan.expected_bytes)
-            pending.append(plan)
+            search_rows.append(row)
+
+    for row in search_rows:
+        callbacks.stage(camera_key(row), "searching", row)
 
     run_dir = prepare_segments_dir(args.output_dir)
+    submitted_plans = []
+    active = collections.Counter()
+    running = {}
+    search_futures = {}
+    search_pool = None
+    download_pool = None
+
     try:
-        active = collections.Counter()
-        running = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            while pending or running:
-                if cancel_event is not None and cancel_event.is_set():
-                    for plan in pending:
+        if search_rows:
+            search_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(rows))
+            )
+            for row in search_rows:
+                host = row["nvr"].strip()
+                fut = search_pool.submit(
+                    _search_and_mark_camera,
+                    row,
+                    clients[host],
+                    start,
+                    end,
+                    args,
+                    callbacks,
+                    cancel_event,
+                )
+                search_futures[fut] = row
+
+        download_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, args.workers)
+        )
+
+        while search_futures or pending or running:
+            if cancel_event is not None and cancel_event.is_set():
+                bg_processor.cancel()
+                for sf in list(search_futures.keys()):
+                    sf.cancel()
+                for plan in pending:
+                    results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
+                                    "channel": plan.row["channel"].strip(), "ok": False,
+                                    "errors": ["cancelled"], "notes": [], "files": []})
+                    callbacks.stage(plan.key, "cancelled", plan.row, errors=["cancelled"], notes=[], files=[])
+                pending.clear()
+
+            # Start ready cameras whose NVR still has a free download slot.
+            if cancel_event is None or not cancel_event.is_set():
+                while pending and len(running) < args.workers:
+                    nxt = next((p for p in pending if active[p.row["nvr"].strip()] < args.per_nvr), None)
+                    if nxt is None:
+                        break
+                    pending.remove(nxt)
+                    host = nxt.row["nvr"].strip()
+                    active[host] += 1
+                    submitted_plans.append(nxt)
+                    fut = download_pool.submit(
+                        process_camera,
+                        nxt,
+                        args,
+                        start,
+                        end,
+                        clients[host],
+                        run_dir,
+                        callbacks,
+                        proc_registry,
+                        cancel_event,
+                        bg_processor=bg_processor,
+                        camera_tracker=camera_tracker,
+                    )
+                    running[fut] = host
+
+            all_active = set(running.keys()) | set(search_futures.keys())
+            if not all_active:
+                break
+
+            done, _ = concurrent.futures.wait(
+                all_active, timeout=0.1, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+
+            for fut in done:
+                if fut in running:
+                    host = running.pop(fut)
+                    active[host] -= 1
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+                elif fut in search_futures:
+                    row = search_futures.pop(fut)
+                    try:
+                        plan = fut.result()
+                    except (Cancelled, concurrent.futures.CancelledError):
+                        plan = CameraPlan(row=row, key=camera_key(row))
+                        plan.error = "cancelled"
+                    except Exception as e:
+                        plan = CameraPlan(row=row, key=camera_key(row))
+                        plan.error = f"search: {e}"
+
+                    if cancel_event is not None and cancel_event.is_set():
                         results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
                                         "channel": plan.row["channel"].strip(), "ok": False,
                                         "errors": ["cancelled"], "notes": [], "files": []})
                         callbacks.stage(plan.key, "cancelled", plan.row, errors=["cancelled"], notes=[], files=[])
-                    pending = []
-                # Start the next camera whose NVR still has a free download slot.
-                nxt = next((p for p in pending if active[p.row["nvr"].strip()] < args.per_nvr), None)
-                if nxt is not None and len(running) < args.workers:
-                    pending.remove(nxt)
-                    host = nxt.row["nvr"].strip()
-                    active[host] += 1
-                    fut = pool.submit(process_camera, nxt, args, start, end, clients[host], run_dir,
-                                      callbacks, proc_registry, cancel_event)
-                    running[fut] = host
-                    continue
-                if not running:
-                    break  # pending is also empty (loop condition); shouldn't reach here but be safe
-                done, _ = concurrent.futures.wait(running, timeout=0.5,
-                                                  return_when=concurrent.futures.FIRST_COMPLETED)
-                for fut in done:
-                    active[running.pop(fut)] -= 1
-                    results.append(fut.result())
+                    elif plan.error:
+                        results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
+                                        "channel": plan.row["channel"].strip(), "ok": False,
+                                        "errors": [plan.error], "notes": [], "files": []})
+                        callbacks.stage(plan.key, "cancelled" if plan.error == "cancelled" else "fail",
+                                        plan.row, errors=[plan.error], notes=[], files=[])
+                    else:
+                        callbacks.stage(plan.key, "queued", plan.row, expected_bytes=plan.expected_bytes)
+                        pending.append(plan)
+
+        # All camera downloads have completed. Wait for background tasks (remuxing, etc.) to drain.
+        bg_processor.wait_all()
+
+        for plan in submitted_plans:
+            if camera_tracker.has_camera(plan.key):
+                results.append(camera_tracker.get_result(plan.key))
+            else:
+                results.append({"name": plan.row.get("name"), "nvr": plan.row["nvr"].strip(),
+                                "channel": plan.row["channel"].strip(), "ok": False,
+                                "errors": ["camera execution failed"], "notes": [], "files": []})
     finally:
+        if search_pool is not None:
+            search_pool.shutdown(wait=False, cancel_futures=True)
+        if download_pool is not None:
+            download_pool.shutdown(wait=True)
+        if own_bg:
+            bg_processor.shutdown(wait=True)
+        camera_tracker.cleanup()
         shutil.rmtree(run_dir, ignore_errors=True)
     return results
 
 
+class WindowPrefetcher:
+    """Proactively searches recordings for window K+1 in the background while window K downloads."""
+
+    def __init__(self, rows, clients, args, cancel_event=None, max_workers=4):
+        self.rows = list(rows or [])
+        self.clients = clients if clients is not None else {}
+        self.args = args
+        self.cancel_event = cancel_event
+        effective_workers = max(1, min(max_workers, len(self.rows))) if self.rows else 1
+        self.max_workers = effective_workers
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
+        self.future = None
+        self.target_window = None
+        self._futures = {}
+        self._results = {}
+        self._lock = threading.RLock()
+        self._shutdown = False
+
+    def start_prefetch(self, start, end):
+        """Launch background pre-fetching of _search_and_mark_camera for all rows for window (start, end)."""
+        if self._shutdown:
+            return
+
+        with self._lock:
+            for fut in list(self._futures.keys()):
+                if not fut.done():
+                    fut.cancel()
+            self._futures.clear()
+            self._results.clear()
+            self.target_window = (start, end)
+            self.future = concurrent.futures.Future()
+
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                self.future.set_result({})
+                return
+
+            if not self.rows:
+                self.future.set_result({})
+                return
+
+            for row in self.rows:
+                host = row["nvr"].strip()
+                client = self.clients.setdefault(host, NvrClient(host, self.args.user, self.args.password, self.args.timeout))
+                fut = self.executor.submit(
+                    _search_and_mark_camera,
+                    row,
+                    client,
+                    start,
+                    end,
+                    self.args,
+                    None,
+                    self.cancel_event,
+                )
+                self._futures[fut] = row
+
+            futs_to_bind = list(self._futures.keys())
+
+        def _on_future_done(f):
+            with self._lock:
+                if f in self._futures:
+                    r = self._futures[f]
+                    k = camera_key(r)
+                    try:
+                        plan = f.result()
+                    except (Cancelled, concurrent.futures.CancelledError):
+                        plan = CameraPlan(row=r, key=k)
+                        plan.error = "cancelled"
+                    except Exception as exc:
+                        plan = CameraPlan(row=r, key=k)
+                        plan.error = f"search: {exc}"
+                    self._results[k] = plan
+                    if len(self._results) >= len(self._futures):
+                        if self.future and not self.future.done():
+                            self.future.set_result(dict(self._results))
+
+        for fut in futs_to_bind:
+            fut.add_done_callback(_on_future_done)
+
+    def _collect_done_plans(self):
+        res = dict(self._results)
+        for fut, row in list(self._futures.items()):
+            k = camera_key(row)
+            if k not in res and fut.done():
+                try:
+                    plan = fut.result()
+                except (Cancelled, concurrent.futures.CancelledError):
+                    plan = CameraPlan(row=row, key=k)
+                    plan.error = "cancelled"
+                except Exception as exc:
+                    plan = CameraPlan(row=row, key=k)
+                    plan.error = f"search: {exc}"
+                res[k] = plan
+        return res
+
+    def get_prefetched(self, timeout=None):
+        """Return dict of {camera_key: CameraPlan} or None if not started/failed."""
+        if not self.future:
+            return None
+
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            with self._lock:
+                return self._collect_done_plans()
+
+        eff_timeout = timeout if timeout is not None else 1.0
+        deadline = time.monotonic() + eff_timeout
+        while not self.future.done():
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                with self._lock:
+                    return self._collect_done_plans()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with self._lock:
+                    return self._collect_done_plans()
+            try:
+                return self.future.result(timeout=min(0.05, max(0.001, remaining)))
+            except concurrent.futures.TimeoutError:
+                continue
+            except (concurrent.futures.CancelledError, Exception):
+                with self._lock:
+                    return self._collect_done_plans()
+        try:
+            return self.future.result()
+        except Exception:
+            with self._lock:
+                return self._collect_done_plans()
+
+    def cancel(self):
+        """Cancel futures and shut down executor."""
+        self._shutdown = True
+        with self._lock:
+            if self.future and not self.future.done():
+                self.future.cancel()
+            for fut in list(self._futures.keys()):
+                fut.cancel()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def _do_prefetch(self, start, end):
+        """Synchronously search recordings for all rows for window (start, end)."""
+        plans = {}
+        for row in self.rows:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                break
+            host = row["nvr"].strip()
+            client = self.clients.setdefault(host, NvrClient(host, self.args.user, self.args.password, self.args.timeout))
+            plan = _search_and_mark_camera(row, client, start, end, self.args, None, self.cancel_event)
+            plans[camera_key(row)] = plan
+        return plans
+
+
 def run_windows(rows, args, windows, callbacks=None, cancel_event=None, proc_registry=None, on_window=None):
-    """Run ingestion sequentially across multiple (start, end) windows (e.g. daily recurring windows)."""
+    """Run ingestion sequentially across multiple (start, end) windows (e.g. daily recurring windows)
+    with pipelined background pre-fetching.
+    """
+    if not windows or not rows:
+        return []
+
+    clients = {}
+    for r in rows:
+        host = r["nvr"].strip()
+        clients.setdefault(host, NvrClient(host, args.user, args.password, args.timeout))
+
+    prefetcher = WindowPrefetcher(rows, clients, args, cancel_event=cancel_event)
     all_results = []
-    for idx, (start, end) in enumerate(windows, 1):
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        if on_window:
-            on_window(idx, len(windows), start, end)
-        results = run_batch(rows, args, start, end, callbacks, cancel_event, proc_registry)
-        all_results.extend(results)
+    current_prefetched_plans = None
+
+    try:
+        for idx, (start, end) in enumerate(windows, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            if on_window:
+                on_window(idx, len(windows), start, end)
+
+            # If there is a next window (K+1), launch background pre-fetch while Window K downloads.
+            if idx < len(windows):
+                next_start, next_end = windows[idx]
+                prefetcher.start_prefetch(next_start, next_end)
+
+            results = run_batch(
+                rows,
+                args,
+                start,
+                end,
+                callbacks=callbacks,
+                cancel_event=cancel_event,
+                proc_registry=proc_registry,
+                prefetched_plans=current_prefetched_plans,
+                clients=clients,
+            )
+            all_results.extend(results)
+
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            # Collect pre-fetched plans for the next window
+            if idx < len(windows):
+                current_prefetched_plans = prefetcher.get_prefetched()
+            else:
+                current_prefetched_plans = None
+    finally:
+        prefetcher.cancel()
+
     return all_results
 
 
@@ -1226,6 +2397,8 @@ def main():
     ap.add_argument("--output-dir", default="output")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Max parallel downloads overall")
     ap.add_argument("--per-nvr", type=int, default=DEFAULT_PER_NVR, help="Max parallel downloads per NVR")
+    ap.add_argument("--remux-workers", type=int, default=DEFAULT_REMUX_WORKERS,
+                    help="Max parallel background remuxing workers (default 2)")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S, help="Network stall timeout (s)")
     ap.add_argument("--trim", action="store_true",
                     help="Trim and join the downloaded segments into one clip covering exactly the window "

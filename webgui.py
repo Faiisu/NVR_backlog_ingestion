@@ -25,7 +25,8 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 UI_STATE_PATH = os.path.join(BASE_DIR, "webgui_state.json")
 MODES = ("both", "snapshot", "clip")
 UI_DEFAULTS = {"csv": DEFAULT_CSV, "mode": "both", "workers": core.DEFAULT_WORKERS,
-               "per_nvr": core.DEFAULT_PER_NVR, "timeout": core.DEFAULT_TIMEOUT_S,
+               "per_nvr": core.DEFAULT_PER_NVR, "remux_workers": core.DEFAULT_REMUX_WORKERS,
+               "timeout": core.DEFAULT_TIMEOUT_S,
                "tz_offset_hours": 7, "last_minutes": 5, "start": "", "end": "", "trim": False,
                "time_mode": "single", "start_date": "", "end_date": "", "daily_start": "10:00", "daily_end": "22:00"}
 FINAL_STAGES = ("ok", "fail", "cancelled")
@@ -35,6 +36,7 @@ ETA_WINDOW_S = 20
 LOCK = threading.RLock()
 CANCEL_EVENT = threading.Event()
 REGISTRY = core.ProcRegistry()
+ACTIVE_PREFETCHER = None
 
 
 def fresh_state():
@@ -113,9 +115,12 @@ class GuiCallbacks(core.Callbacks):
             cam = STATE["cameras"].get(key)
             if cam is None:
                 return  # key not tracked in this run (should not happen); ignore silently
+            prev_stage = cam.get("stage")
             cam["stage"] = stage
-            cam["error"] = "; ".join(short_error(e) for e in errors) or None
-            cam["note"] = "; ".join(notes) or None
+            if errors or stage in FINAL_STAGES:
+                cam["error"] = "; ".join(short_error(e) for e in errors) or None
+            if notes or stage in FINAL_STAGES:
+                cam["note"] = "; ".join(notes) or None
             if files:
                 for p in files:
                     rp = rel(p)
@@ -123,10 +128,13 @@ class GuiCallbacks(core.Callbacks):
                         cam["files"].append(rp)
             if expected_bytes is not None:
                 cam["expected"] = expected_bytes
-            if stage in ("queued", "fail", "cancelled") and STATE["phase"] == "searching":
-                RUN["searched"] += 1
+            if stage == "downloading":
+                STATE["phase"] = "downloading"
+            if prev_stage == "searching" and stage in ("queued", "fail", "cancelled"):
+                RUN["searched"] = RUN.get("searched", 0) + 1
                 if RUN["searched"] == STATE.get("cams_count", STATE["total"]):
-                    STATE["phase"] = "downloading"
+                    if STATE["phase"] == "searching":
+                        STATE["phase"] = "downloading"
                     log_line(f"Search done: {sum(c['expected'] for c in STATE['cameras'].values()) / 1e9:.2f} GB "
                              "of recordings to download")
             if stage in FINAL_STAGES:
@@ -143,19 +151,24 @@ class GuiCallbacks(core.Callbacks):
             if cam is None:
                 return
             cam["bytes"] += n
-            RUN["downloaded"] += n
+            RUN["downloaded"] = RUN.get("downloaded", 0) + n
 
 
 def update_stats():
     now = time.monotonic()
-    samples = RUN["samples"]
-    samples.append((now, RUN["downloaded"]))
+    samples = RUN.get("samples")
+    if samples is None:
+        samples = collections.deque()
+        RUN["samples"] = samples
+    samples.append((now, RUN.get("downloaded", 0)))
     while len(samples) > 1 and now - samples[0][0] > ETA_WINDOW_S:
         samples.popleft()
 
     def rate_over(window):
+        if not samples:
+            return 0
         old = next(((t, b) for t, b in samples if now - t <= window), samples[0])
-        return (RUN["downloaded"] - old[1]) / (now - old[0]) if now > old[0] else 0
+        return (RUN.get("downloaded", 0) - old[1]) / (now - old[0]) if now > old[0] else 0
 
     cams = STATE["cameras"].values()
     cur_win_expected = sum(max(c["expected"], c["bytes"]) for c in cams if c["stage"] not in ("fail", "cancelled") or c["bytes"])
@@ -181,16 +194,17 @@ def update_stats():
         STATE["window_expected_bytes"] = cur_win_expected
         total_remaining = cur_win_remaining
 
-    STATE["bytes"] = RUN["downloaded"]
+    STATE["bytes"] = RUN.get("downloaded", 0)
     STATE["rate_bps"] = rate_over(SPEED_WINDOW_S)
-    STATE["elapsed_s"] = round(now - RUN["t0"])
+    t0 = RUN.get("t0", now)
+    STATE["elapsed_s"] = round(now - t0)
 
-    if STATE["mode"] == "snapshot":
+    if STATE.get("mode") == "snapshot":
         STATE["eta_s"] = None
         fraction = STATE["done"] / max(STATE["total"], 1)
     else:
         eta_rate = rate_over(ETA_WINDOW_S)
-        waiting = STATE["phase"] == "searching" or STATE["cancelling"]
+        waiting = STATE["phase"] == "searching" or STATE.get("cancelling", False)
         STATE["eta_s"] = None if waiting or eta_rate <= 0 else round(total_remaining / eta_rate)
         if total_windows > 1:
             cams_count = STATE.get("cams_count") or len(cams) or 1
@@ -201,7 +215,7 @@ def update_stats():
                 win_fraction = max(0.0, completed_in_window / cams_count)
             fraction = ((idx - 1) + min(win_fraction, 1.0)) / total_windows
         else:
-            fraction = RUN["downloaded"] / STATE["expected_bytes"] if STATE["expected_bytes"] else 0
+            fraction = RUN.get("downloaded", 0) / STATE["expected_bytes"] if STATE["expected_bytes"] else 0
     # Never move backwards (e.g. when a segment turns out larger than the search reported).
     STATE["fraction"] = max(STATE["fraction"], min(fraction, 0.99))
 
@@ -331,6 +345,9 @@ def plan_run(payload):
     per_nvr = _param(payload, "per_nvr", int, "Downloads per NVR")
     if not 1 <= per_nvr <= 10:
         raise ValueError("Downloads per NVR must be between 1 and 10")
+    remux_workers = _param(payload, "remux_workers", int, "Remux workers")
+    if not 1 <= remux_workers <= 8:
+        raise ValueError("Remux workers must be between 1 and 8")
     timeout = _param(payload, "timeout", int, "Network timeout")
     if not 5 <= timeout <= 600:
         raise ValueError("Network timeout must be between 5 and 600 seconds")
@@ -381,10 +398,12 @@ def plan_run(payload):
     args.output_dir = OUTPUT_DIR
     args.workers = workers
     args.per_nvr = per_nvr
+    args.remux_workers = remux_workers
     args.timeout = timeout
     args.trim = trim
 
-    ui = {"csv": csv_path, "mode": mode, "workers": workers, "per_nvr": per_nvr, "timeout": timeout,
+    ui = {"csv": csv_path, "mode": mode, "workers": workers, "per_nvr": per_nvr,
+          "remux_workers": remux_workers, "timeout": timeout,
           "tz_offset_hours": tz, "last_minutes": last_minutes, "start": start, "end": end, "trim": trim,
           "time_mode": time_mode, "start_date": start_date, "end_date": end_date,
           "daily_start": daily_start, "daily_end": daily_end}
@@ -392,11 +411,40 @@ def plan_run(payload):
 
 
 def do_run(plan):
+    global ACTIVE_PREFETCHER
+    CANCEL_EVENT.clear()
     finished = threading.Event()
     threading.Thread(target=stats_loop, args=(finished,), daemon=True).start()
     windows = plan["windows"]
     total_windows = len(windows)
     all_results = []
+
+    args = plan.get("args")
+    if args is None:
+        class DummyArgs:
+            pass
+        args = DummyArgs()
+        args.user = "admin"
+        args.password = core.DEFAULT_PASSWORDS
+        args.timeout = core.DEFAULT_TIMEOUT_S
+        args.workers = core.DEFAULT_WORKERS
+        args.per_nvr = core.DEFAULT_PER_NVR
+        args.remux_workers = core.DEFAULT_REMUX_WORKERS
+        args.mode = "both"
+        args.output_dir = OUTPUT_DIR
+        args.trim = False
+
+    clients = {}
+    for r in plan["rows"]:
+        host = r["nvr"].strip()
+        clients.setdefault(host, core.NvrClient(host, getattr(args, "user", "admin"),
+                                                getattr(args, "password", core.DEFAULT_PASSWORDS),
+                                                getattr(args, "timeout", core.DEFAULT_TIMEOUT_S)))
+
+    prefetcher = core.WindowPrefetcher(plan["rows"], clients, args, cancel_event=CANCEL_EVENT)
+    ACTIVE_PREFETCHER = prefetcher
+    current_prefetched_plans = None
+
     try:
         for idx, (w_start, w_end) in enumerate(windows, 1):
             if CANCEL_EVENT.is_set():
@@ -409,28 +457,74 @@ def do_run(plan):
                     STATE["window"] = f"{w_start} -> {w_end} (NVR local time)"
                 STATE["current_window"] = idx
                 STATE["total_windows"] = total_windows
-                STATE["phase"] = "searching"
-                RUN["searched"] = 0
+
+                if idx == 1 or not current_prefetched_plans:
+                    STATE["phase"] = "searching"
+                    RUN["searched"] = 0
+                else:
+                    STATE["phase"] = "downloading"
+                    RUN["searched"] = len(current_prefetched_plans)
+
                 for row in plan["rows"]:
-                    cam = STATE["cameras"][core.camera_key(row)]
-                    cam["stage"] = "searching"
+                    k = core.camera_key(row)
+                    if k not in STATE["cameras"]:
+                        STATE["cameras"][k] = {
+                            "name": row.get("name"), "nvr": row.get("nvr", "").strip(),
+                            "channel": row.get("channel", "").strip(),
+                            "stage": "searching", "ok": None, "error": None, "note": None,
+                            "files": [], "bytes": 0, "expected": 0,
+                        }
+                    cam = STATE["cameras"][k]
+                    if current_prefetched_plans and k in current_prefetched_plans:
+                        p = current_prefetched_plans[k]
+                        cam["stage"] = "fail" if p.error else "queued"
+                        cam["expected"] = p.expected_bytes
+                    else:
+                        cam["stage"] = "searching"
+                        cam["expected"] = 0
                     cam["ok"] = None
                     cam["error"] = None
                     cam["note"] = None
-                    cam["expected"] = 0
                     cam["bytes"] = 0
 
-            w_results = core.run_batch(plan["rows"], plan["args"], w_start, w_end,
-                                       callbacks=GuiCallbacks(), cancel_event=CANCEL_EVENT, proc_registry=REGISTRY)
+            # If there is a next window (idx < total_windows), trigger background prefetch
+            if idx < total_windows:
+                next_w_start, next_w_end = windows[idx]
+                prefetcher.start_prefetch(next_w_start, next_w_end)
+                log_line(f"Pre-fetching Day {idx+1}/{total_windows} ({next_w_start.strftime('%Y-%m-%d')})...")
+
+            w_results = core.run_batch(
+                plan["rows"],
+                args,
+                w_start,
+                w_end,
+                callbacks=GuiCallbacks(),
+                cancel_event=CANCEL_EVENT,
+                proc_registry=REGISTRY,
+                prefetched_plans=current_prefetched_plans,
+                clients=clients,
+            )
             with LOCK:
                 cams = STATE["cameras"].values()
                 win_expected = sum(max(c["expected"], c["bytes"]) for c in cams if c["stage"] not in ("fail", "cancelled") or c["bytes"])
                 RUN.setdefault("window_expected_history", []).append(win_expected)
-                RUN["completed_windows_bytes"] = RUN["downloaded"]
+                RUN["completed_windows_bytes"] = RUN.get("downloaded", 0)
             if total_windows > 1:
                 for r in w_results:
                     r.setdefault("notes", []).insert(0, f"[{w_start.strftime('%Y-%m-%d')}]")
             all_results.extend(w_results)
+
+            if CANCEL_EVENT.is_set():
+                break
+
+            # When window K finishes, retrieve pre-fetched plans for next window
+            if idx < total_windows:
+                current_prefetched_plans = prefetcher.get_prefetched()
+                with LOCK:
+                    next_idx = idx + 1
+                    next_start, next_end = windows[idx]
+                    STATE["window"] = f"[{next_idx}/{total_windows}] {next_start} -> {next_end} (NVR local time)"
+                    # Transition STATE["window"] without blanking STATE["phase"] to "searching"
 
         log_path = os.path.join(OUTPUT_DIR, "logs", f"run_{datetime.now():%Y%m%d_%H%M%S}.csv")
         core.write_run_log(all_results, log_path)
@@ -442,6 +536,11 @@ def do_run(plan):
             STATE["error"] = str(e)
             log_line(f"ERROR: {e}")
     finally:
+        try:
+            prefetcher.cancel()
+        except Exception:
+            pass
+        ACTIVE_PREFETCHER = None
         finished.set()
         with LOCK:
             update_stats()
@@ -559,6 +658,8 @@ tr.off td:last-child{opacity:1}
     <div class="hint">cameras downloading at once (4 ≈ full 1 Gbps link)</div></div>
   <div><label>Downloads per NVR</label><input id="per_nvr" type="number" min="1" max="10">
     <div class="hint">one NVR tops out ~500 Mbps; 2 is best</div></div>
+  <div><label>Remux Workers</label><input id="remux_workers" type="number" min="1" max="8">
+    <div class="hint">(Max parallel ffmpeg packaging processes)</div></div>
   <div><label>Network timeout (s)</label><input id="timeout" type="number" min="5" max="600"></div>
   <div><label>NVR timezone (hrs)</label><input id="tz_offset_hours" type="number" step="0.5">
     <div class="hint">7 = Thailand; only used for "last N minutes"</div></div>
@@ -630,7 +731,7 @@ tr.off td:last-child{opacity:1}
 </fieldset>
 
 <script>
-const FIELDS = ['csv','mode','workers','per_nvr','timeout','tz_offset_hours','last_minutes','start','end',
+const FIELDS = ['csv','mode','workers','per_nvr','remux_workers','timeout','tz_offset_hours','last_minutes','start','end',
                 'start_date','end_date','daily_start','daily_end'];
 const TRIM_HINT = {
   false: 'Off: downloads whole recording segments and packages them into real MP4 (~1 GB per ~70 min per camera). '
@@ -1152,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
             update_stats()
             log_line(f"Starting run: {cams_count} cameras, {total_windows} window(s), mode={args.mode}, "
-                     f"parallel={args.workers}, per NVR={args.per_nvr}, "
+                     f"parallel={args.workers}, per NVR={args.per_nvr}, remux_workers={args.remux_workers}, "
                      + ("trim & join to exact window" if args.trim else "whole recording files"))
             CANCEL_EVENT.clear()
             REGISTRY = core.ProcRegistry()
@@ -1165,16 +1266,30 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _cancel(self):
-        with LOCK:
-            if not STATE["running"]:
-                self._json({"ok": False, "error": "no run in progress"}, 409)
-                return
-            STATE["cancelling"] = True
-            log_line("Stop requested: aborting downloads, skipping queued cameras")
-            CANCEL_EVENT.set()
-            registry = REGISTRY
-        registry.kill_all()
+        ok, err = _cancel()
+        if not ok:
+            self._json({"ok": False, "error": err}, 409)
+            return
         self._json({"ok": True})
+
+
+def _cancel():
+    global ACTIVE_PREFETCHER
+    with LOCK:
+        if not STATE["running"]:
+            return False, "no run in progress"
+        STATE["cancelling"] = True
+        log_line("Stop requested: aborting downloads, skipping queued cameras")
+        CANCEL_EVENT.set()
+        prefetcher = ACTIVE_PREFETCHER
+        registry = REGISTRY
+    if prefetcher is not None:
+        try:
+            prefetcher.cancel()
+        except Exception:
+            pass
+    registry.kill_all()
+    return True, None
 
 
 def main():
