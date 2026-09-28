@@ -24,6 +24,25 @@ Measured 2026-09-16: one download ~390 Mbps; one NVR tops out ~500 Mbps; 4 paral
 different NVRs ~800-850 Mbps (the ~1 Gbps link). Defaults: 4 parallel downloads, at most 2 per NVR.
 The old RTSP playback method was limited to real time (~2.4 Mbps per camera).
 
+## Code structure
+
+The implementation lives in the `nvr_ingestion/` package. The root scripts remain stable entry points for existing commands and imports.
+
+```text
+nvr_ingestion/
+├── core.py              # media processing, download pipeline, and CLI
+├── inventory.py         # CSV, credentials, disabled cameras, and naming
+├── isapi.py             # ISAPI search and NVR downloads
+├── runtime.py           # cancellation and subprocess lifecycle
+├── time_windows.py      # NVR-local time parsing and window calculations
+└── web/
+    ├── app.py           # HTTP API, run state, and web GUI behavior
+    └── page.py          # HTML page served by the GUI
+
+cctv_retrieve.py         # CLI compatibility entry point
+webgui.py                # Web GUI compatibility entry point
+```
+
 ## Time
 These NVRs label their **local clock (GMT+7) with a `Z` suffix** in ISAPI and RTSP playback times
 (verified against the on-screen clock). Start/end are therefore NVR local time and sent unchanged.
