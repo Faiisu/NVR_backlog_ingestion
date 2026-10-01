@@ -443,11 +443,17 @@ def do_run(plan):
                                                 getattr(args, "password", core.DEFAULT_PASSWORDS),
                                                 getattr(args, "timeout", core.DEFAULT_TIMEOUT_S)))
 
-    prefetcher = core.WindowPrefetcher(plan["rows"], clients, args, cancel_event=CANCEL_EVENT)
-    ACTIVE_PREFETCHER = prefetcher
+    prefetcher = None
+    ACTIVE_PREFETCHER = None
     current_prefetched_plans = None
 
     try:
+        with LOCK:
+            STATE["phase"] = "checking_credentials"
+            log_line(f"Checking credentials on {len(clients)} active NVR(s)...")
+        core.validate_nvr_credentials(plan["rows"], clients, cancel_event=CANCEL_EVENT)
+        prefetcher = core.WindowPrefetcher(plan["rows"], clients, args, cancel_event=CANCEL_EVENT)
+        ACTIVE_PREFETCHER = prefetcher
         for idx, (w_start, w_end) in enumerate(windows, 1):
             if CANCEL_EVENT.is_set():
                 break

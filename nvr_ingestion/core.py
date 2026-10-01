@@ -683,13 +683,40 @@ def is_real_mp4(path):
     """Check whether `path` is a genuine MP4 container (ISO BMFF).
     Legacy files downloaded directly from Hikvision NVR are MPEG-PS streams named .mp4;
     they start with IMKH/HKMI or MPEG-PS pack headers (00 00 01 BA) instead of an 'ftyp' or 'moov' box.
+    Also verify every top-level box fits inside the file, so a truncated MP4 isn't treated as complete.
     """
-    if not os.path.isfile(path) or os.path.getsize(path) < 16:
+    if not os.path.isfile(path):
         return False
     try:
+        file_size = os.path.getsize(path)
+        if file_size < 16:
+            return False
+        offset = 0
+        has_ftyp = has_moov = has_mdat = False
         with open(path, "rb") as f:
-            header = f.read(16)
-        return len(header) >= 8 and header[4:8] in (b"ftyp", b"moov")
+            while offset + 8 <= file_size:
+                f.seek(offset)
+                header = f.read(8)
+                if len(header) != 8:
+                    return False
+                box_size = int.from_bytes(header[:4], "big")
+                box_type = header[4:8]
+                header_size = 8
+                if box_size == 1:
+                    extended = f.read(8)
+                    if len(extended) != 8:
+                        return False
+                    box_size = int.from_bytes(extended, "big")
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+                if box_size < header_size or offset + box_size > file_size:
+                    return False
+                has_ftyp |= box_type == b"ftyp"
+                has_moov |= box_type == b"moov"
+                has_mdat |= box_type == b"mdat"
+                offset += box_size
+        return offset == file_size and has_ftyp and has_moov and has_mdat
     except OSError:
         return False
 
@@ -1611,6 +1638,18 @@ def _search_and_mark_camera(row, client, start, end, args, callbacks, cancel_eve
         return plan
 
 
+def validate_nvr_credentials(rows, clients, cancel_event=None):
+    """Check authentication once per active NVR before any recording search starts."""
+    for host in dict.fromkeys(row["nvr"].strip() for row in rows):
+        check_cancel(cancel_event)
+        client = clients[host]
+        check_credentials = getattr(client, "check_credentials", None)
+        if check_credentials is None or getattr(client, "_credentials_validated", False):
+            continue
+        print(f"Checking credentials for NVR {host}...", file=sys.stderr, flush=True)
+        check_credentials(cancel_event=cancel_event)
+
+
 def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_registry=None,
               bg_processor=None, camera_tracker=None, prefetched_plans=None, clients=None):
     """Search every camera's recordings, then download and trim with at most `args.workers` downloads
@@ -1620,6 +1659,13 @@ def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_re
 
     callbacks = callbacks or Callbacks()
     proc_registry = proc_registry or ProcRegistry()
+
+    if clients is None:
+        clients = {}
+    for row in rows:
+        host = row["nvr"].strip()
+        clients.setdefault(host, NvrClient(host, args.user, args.password, args.timeout))
+    validate_nvr_credentials(rows, clients, cancel_event=cancel_event)
 
     own_bg = False
     if bg_processor is None:
@@ -1633,12 +1679,6 @@ def run_batch(rows, args, start, end, callbacks=None, cancel_event=None, proc_re
 
     if camera_tracker is None:
         camera_tracker = CameraTaskTracker()
-
-    if clients is None:
-        clients = {}
-    for row in rows:
-        host = row["nvr"].strip()
-        clients.setdefault(host, NvrClient(host, args.user, args.password, args.timeout))
 
     if prefetched_plans:
         if isinstance(prefetched_plans, dict):
@@ -1967,11 +2007,13 @@ def run_windows(rows, args, windows, callbacks=None, cancel_event=None, proc_reg
         host = r["nvr"].strip()
         clients.setdefault(host, NvrClient(host, args.user, args.password, args.timeout))
 
-    prefetcher = WindowPrefetcher(rows, clients, args, cancel_event=cancel_event)
+    prefetcher = None
     all_results = []
     current_prefetched_plans = None
 
     try:
+        validate_nvr_credentials(rows, clients, cancel_event=cancel_event)
+        prefetcher = WindowPrefetcher(rows, clients, args, cancel_event=cancel_event)
         for idx, (start, end) in enumerate(windows, 1):
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -2006,7 +2048,8 @@ def run_windows(rows, args, windows, callbacks=None, cancel_event=None, proc_reg
             else:
                 current_prefetched_plans = None
     finally:
-        prefetcher.cancel()
+        if prefetcher is not None:
+            prefetcher.cancel()
 
     return all_results
 
@@ -2119,7 +2162,10 @@ def main():
             print(f"\n--- Day {idx}/{total}: {start} -> {end} ---", flush=True)
 
     t0 = time.time()
-    results = run_windows(rows, args, windows, ConsoleCallbacks(), on_window=on_window)
+    try:
+        results = run_windows(rows, args, windows, ConsoleCallbacks(), on_window=on_window)
+    except IsapiError as e:
+        sys.exit(str(e))
 
     ok_count = sum(1 for r in results if r["ok"])
     print(f"\nDone in {time.time() - t0:.0f}s: {ok_count}/{len(results)} succeeded")

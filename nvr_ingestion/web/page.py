@@ -421,6 +421,7 @@ function renderProgress(s){
   if (s.running) {
     let eta;
     if (s.cancelling) eta = 'stopping…';
+    else if (s.phase === 'checking_credentials') eta = 'checking NVR credentials…';
     else if (s.phase === 'repairing') eta = 'repairing legacy files…';
     else if (s.phase === 'searching') eta = 'searching recordings…';
     else if (snapshotOnly) eta = `${s.done}/${s.total} cameras`;

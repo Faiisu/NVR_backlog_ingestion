@@ -54,6 +54,7 @@ class NvrClient:
             self.passwords = passwords or list(DEFAULT_PASSWORDS)
         self.active_password = self.passwords[0] if self.passwords else ""
         self.password = self.active_password
+        self._credentials_validated = False
 
     def check_network(self):
         try:
@@ -102,7 +103,7 @@ class NvrClient:
                 elif wait_s < 60 and remaining % 10 == 0:
                     on_status(f"Login lockout cooldown for NVR {self.host}: {remaining}s remaining before retrying (account lockout cooldown)...")
 
-    def _open(self, path, body, cancel_event=None, on_status=None):
+    def _open(self, path, body, cancel_event=None, on_status=None, method=None, retry_auth=True):
         data = body.encode() if isinstance(body, str) else body
 
         while True:
@@ -117,7 +118,8 @@ class NvrClient:
                     mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
                     mgr.add_password(None, self.base + "/", self.user, candidate)
                     opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
-                    req = urllib.request.Request(self.base + path, data, {"Content-Type": "application/xml"})
+                    headers = {"Content-Type": "application/xml"} if data is not None else {}
+                    req = urllib.request.Request(self.base + path, data, headers, method=method)
                     try:
                         resp = opener.open(req, timeout=self.timeout)
                         if candidate != self.active_password:
@@ -135,10 +137,22 @@ class NvrClient:
 
             # When all candidate passwords in self.passwords have been attempted and all returned HTTP 401:
             check_cancel(cancel_event)
+            if not retry_auth:
+                raise IsapiError(f"NVR {self.host} rejected the configured username/password (HTTP 401)")
             self.wait_auth_lockout(cancel_event=cancel_event, on_status=on_status)
             if self.passwords:
                 self.active_password = self.passwords[0]
                 self.password = self.active_password
+
+    def check_credentials(self, cancel_event=None, on_status=None):
+        """Validate configured credentials once using the NVR device-info endpoint."""
+        if self._credentials_validated:
+            return True
+        with self._open("/ISAPI/System/deviceInfo", None, cancel_event=cancel_event,
+                        on_status=on_status, method="GET", retry_auth=False) as resp:
+            resp.read()
+        self._credentials_validated = True
+        return True
 
     def search(self, track_id, start, end, cancel_event=None, on_status=None):
         """Recording segments on `track_id` overlapping [start, end), oldest first."""
@@ -189,15 +203,27 @@ class NvrClient:
                 f"<playbackURI>{xml_escape(segment.uri)}</playbackURI></downloadRequest>")
         check_cancel(cancel_event)
         tmp = dest + ".part"
+        reported_bytes = 0
+        committed = False
         try:
             download_done = False
             while not download_done:
                 check_cancel(cancel_event)
                 interrupted = False
+                attempt_received = 0
                 with self._open("/ISAPI/ContentMgmt/download", body, cancel_event=cancel_event, on_status=on_status) as resp, open(tmp, "wb") as f:
                     length = resp.headers.get("Content-Length")
+                    expected_lengths = []
                     if on_length and length and length.isdigit():
                         on_length(int(length))
+                    if length and length.isdigit():
+                        expected_lengths.append(("Content-Length", int(length)))
+                    if segment.size > 0:
+                        expected_lengths.append(("NVR segment size", segment.size))
+                    if len({size for _, size in expected_lengths}) > 1:
+                        details = ", ".join(f"{source}={size}" for source, size in expected_lengths)
+                        raise IsapiError(f"NVR {self.host} reported inconsistent download sizes: {details}")
+                    received = 0
                     while True:
                         check_cancel(cancel_event)
                         try:
@@ -209,13 +235,32 @@ class NvrClient:
                             break
                         if not chunk:
                             break
-                        f.write(chunk)
+                        written = f.write(chunk)
+                        received += written
+                        attempt_received += written
                         if on_bytes:
-                            on_bytes(len(chunk))
+                            on_bytes(written)
+                            reported_bytes += written
+                    if expected_lengths and received != expected_lengths[0][1]:
+                        source, expected = expected_lengths[0]
+                        raise IsapiError(
+                            f"NVR {self.host} incomplete download: received {received} of {expected} bytes "
+                            f"({source})"
+                        )
                 if not interrupted:
                     download_done = True
+                elif on_bytes and attempt_received:
+                    # The next attempt truncates the temp file and starts over, so
+                    # remove this discarded attempt from the caller's progress total.
+                    on_bytes(-attempt_received)
+                    reported_bytes -= attempt_received
             os.replace(tmp, dest)
+            committed = True
         finally:
+            # A failed or cancelled transfer removes its temp file; don't report its
+            # discarded bytes as if they were still present in the completed output.
+            if not committed and on_bytes and reported_bytes:
+                on_bytes(-reported_bytes)
             if os.path.exists(tmp):
                 try:
                     os.remove(tmp)
