@@ -7,6 +7,7 @@ the network can reach it.
 """
 import collections
 import csv
+import io
 import ipaddress
 import json
 import math
@@ -545,7 +546,8 @@ def do_run(plan):
             log_line(f"ERROR: {e}")
     finally:
         try:
-            prefetcher.cancel()
+            if prefetcher is not None:
+                prefetcher.cancel()
         except Exception:
             pass
         ACTIVE_PREFETCHER = None
@@ -589,6 +591,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(load_ui_defaults())
         elif path == "/api/cameras":
             self._list_cameras(parse_qs(urlparse(self.path).query).get("csv", [""])[0])
+        elif path == "/api/inventory/export":
+            self._export_inventory(parse_qs(urlparse(self.path).query).get("csv", [""])[0])
         else:
             self._json({"error": "not found"}, 404)
 
@@ -612,8 +616,12 @@ class Handler(BaseHTTPRequestHandler):
             self._cancel()
         elif path == "/api/cameras/toggle":
             self._toggle_camera(payload)
+        elif path == "/api/cameras/toggle-all":
+            self._toggle_all_cameras(payload)
         elif path == "/api/inventory":
             self._edit_inventory(payload)
+        elif path == "/api/inventory/import":
+            self._import_inventory(payload)
         elif path == "/api/repair-legacies":
             self._repair_legacies(payload)
         else:
@@ -691,6 +699,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json({"ok": True})
 
+    def _toggle_all_cameras(self, payload):
+        keys = payload.get("keys")
+        disabled_value = payload.get("disabled")
+        if not isinstance(keys, list) or any(not isinstance(key, str) or "/" not in key for key in keys):
+            self._json({"ok": False, "error": "invalid camera keys"}, 400)
+            return
+        if not isinstance(disabled_value, bool):
+            self._json({"ok": False, "error": "disabled must be true or false"}, 400)
+            return
+        try:
+            with LOCK:
+                disabled = core.load_disabled()
+                if disabled_value:
+                    disabled.update(keys)
+                else:
+                    disabled.difference_update(keys)
+                core.save_disabled(disabled)
+                log_line(f"{len(set(keys))} cameras {'disabled' if disabled_value else 'enabled'}"
+                         + (" (applies from the next run)" if STATE["running"] else ""))
+        except (ValueError, OSError) as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+            return
+        self._json({"ok": True, "count": len(set(keys))})
+
     def _edit_inventory(self, payload):
         try:
             with LOCK:
@@ -702,6 +734,68 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)}, 400)
             return
         self._json({"ok": True})
+
+    def _export_inventory(self, csv_path):
+        path = csv_path.strip() or DEFAULT_CSV
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            self._json({"ok": False, "error": f"cannot read CSV: {e}"}, 400)
+            return
+        filename = (os.path.basename(path) or "camera_inventory.csv").replace('"', "").replace("\r", "").replace("\n", "")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _import_inventory(self, payload):
+        csv_path = (payload.get("csv") or "").strip() or DEFAULT_CSV
+        content = payload.get("content")
+        if not isinstance(content, str) or not content.strip():
+            self._json({"ok": False, "error": "choose a non-empty CSV file"}, 400)
+            return
+        try:
+            reader = csv.DictReader(io.StringIO(content.lstrip("\ufeff"), newline=""))
+            fields = reader.fieldnames or []
+            required = ("camera_ip", "nvr", "channel", "name", "online")
+            missing = [column for column in required if column not in fields]
+            if missing:
+                raise ValueError("CSV is missing required columns: " + ", ".join(missing))
+            if len(fields) != len(set(fields)):
+                raise ValueError("CSV contains duplicate column names")
+            rows = list(reader)
+            if not rows:
+                raise ValueError("CSV contains no camera rows")
+            for index, row in enumerate(rows, 2):
+                for column in required:
+                    if not (row.get(column) or "").strip():
+                        raise ValueError(f"row {index}: '{column}' cannot be blank")
+                _ip(row["camera_ip"], f"row {index} camera_ip")
+                _ip(row["nvr"], f"row {index} nvr")
+                try:
+                    core.track_id_from_channel(row["channel"].strip())
+                except ValueError as e:
+                    raise ValueError(f"row {index}: {e}") from e
+                if "online" in fields and (row.get("online") or "").strip().upper() not in ("TRUE", "FALSE"):
+                    raise ValueError(f"row {index}: online must be TRUE or FALSE")
+            online_keys = [core.camera_key(row) for row in rows if _is_online(row)]
+            duplicates = sorted(key for key, count in collections.Counter(online_keys).items() if count > 1)
+            if duplicates:
+                raise ValueError("duplicate NVR/channel in CSV: " + ", ".join(duplicates))
+            with LOCK:
+                if STATE["running"]:
+                    self._json({"ok": False, "error": "cannot import cameras while a run is in progress"}, 409)
+                    return
+                write_inventory(csv_path, fields, rows)
+                log_line(f"Imported {len(rows)} camera rows from CSV into {csv_path}")
+        except (ValueError, OSError, csv.Error) as e:
+            self._json({"ok": False, "error": str(e)}, 400)
+            return
+        self._json({"ok": True, "count": len(rows)})
 
     def _save_config(self, payload):
         user = (payload.get("user") or "").strip()
